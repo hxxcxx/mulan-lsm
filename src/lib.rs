@@ -1,6 +1,7 @@
 //! mulan-lsm：Rust 实现的 LSM-Tree 键值存储。
 
 pub mod error;
+pub mod skiplist;
 
 pub use error::{MulanError, Result};
 
