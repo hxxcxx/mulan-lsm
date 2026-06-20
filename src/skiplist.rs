@@ -18,8 +18,6 @@ const NIL: usize = usize::MAX;
 /// 同一个节点被所有它出现的层级共用。
 struct Node<K, V> {
     key: K,
-    // get() 在 1.3 实现，届时移除此 allow。
-    #[allow(dead_code)]
     value: V,
     next: Vec<usize>,
 }
@@ -45,6 +43,35 @@ impl<K, V> SkipList<K, V> {
 
     pub fn max_height(&self) -> usize {
         self.max_height
+    }
+
+    /// 从底层链表头部开始遍历。底层 next[0] 是含全部数据的完整有序链表。
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter {
+            list: self,
+            cur: self.nodes[Self::HEAD].next[0],
+        }
+    }
+}
+
+/// 跳表迭代器：沿底层 next[0] 顺链走，天然有序。
+/// 是 LSM range scan 的基础。
+pub struct Iter<'a, K, V> {
+    list: &'a SkipList<K, V>,
+    cur: usize,
+}
+
+impl<'a, K, V> Iterator for Iter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cur == NIL {
+            return None;
+        }
+        let node = &self.list.nodes[self.cur];
+        let item = (&node.key, &node.value);
+        self.cur = node.next[0];
+        Some(item)
     }
 }
 
@@ -77,6 +104,28 @@ impl<K: Ord, V> SkipList<K, V> {
         height
     }
 
+    /// 精确查找 key，返回对应 value 的引用。未找到返回 None。
+    ///
+    /// 下降逻辑与 find_prev 一致：从最高层往下降，每层向右走到
+    /// "后继 key >= target"处停。最后看底层后继 key 是否恰好等于 target。
+    pub fn get(&self, key: &K) -> Option<&V> {
+        let mut cur: usize = Self::HEAD;
+        for level in (0..self.max_height).rev() {
+            while self.nodes[cur].next[level] != NIL
+                && self.nodes[self.nodes[cur].next[level]].key < *key
+            {
+                cur = self.nodes[cur].next[level];
+            }
+        }
+        // cur 是底层"key < target 的最后一个节点"，看它的后继是否命中。
+        let next = self.nodes[cur].next[0];
+        if next != NIL && self.nodes[next].key == *key {
+            Some(&self.nodes[next].value)
+        } else {
+            None
+        }
+    }
+
     /// 插入一个节点。允许重复 key（LSM 需要同一 user_key 的多个版本）。
     pub fn insert(&mut self, key: K, value: V) {
         let mut rng = rand::rng();
@@ -94,9 +143,13 @@ impl<K: Ord, V> SkipList<K, V> {
         let new_index = self.nodes.len();
         let mut new_node = Node::new(key, value, height);
         // 经典链表插入，在每一层缝合：new.next = prev.next; prev.next = new。
-        for level in 0..height {
-            new_node.next[level] = self.nodes[prev[level]].next[level];
-            self.nodes[prev[level]].next[level] = new_index;
+        // 用 enumerate 拿到层号 level（new_node.next 的下标天然就是层号），
+        // 避免 clippy 的 needless_range_loop。循环体先读 prev 的后继再回写，
+        // 读写在不同的 arena 索引表达式里，不构成借用冲突。
+        for (level, new_next) in new_node.next.iter_mut().enumerate() {
+            let prev_node = &mut self.nodes[prev[level]];
+            *new_next = prev_node.next[level];
+            prev_node.next[level] = new_index;
         }
         self.nodes.push(new_node);
     }
@@ -178,5 +231,73 @@ mod tests {
             }
         }
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn get_hits_existing_keys() {
+        let mut sl: SkipList<i32, &'static str> = SkipList::new();
+        for k in [50, 10, 40, 20, 30, 60, 5, 15] {
+            sl.insert(k, "v");
+        }
+        for k in [50, 10, 40, 20, 30, 60, 5, 15] {
+            assert_eq!(sl.get(&k), Some(&"v"), "missed key {k}");
+        }
+    }
+
+    #[test]
+    fn get_returns_none_for_missing_key() {
+        let mut sl: SkipList<i32, i32> = SkipList::new();
+        for k in [10, 30, 50] {
+            sl.insert(k, k);
+        }
+        // 不存在的 key（含小于最小、大于最大、区间内空隙）。
+        assert_eq!(sl.get(&0), None);
+        assert_eq!(sl.get(&20), None);
+        assert_eq!(sl.get(&100), None);
+    }
+
+    #[test]
+    fn iterator_is_sorted_and_complete() {
+        let mut sl: SkipList<i32, i32> = SkipList::new();
+        let mut rng = rand::rng();
+        let keys: Vec<i32> = (0..500).map(|_| rng.random_range(0..10_000)).collect();
+        for &k in &keys {
+            sl.insert(k, k * 2);
+        }
+        let collected: Vec<(i32, i32)> = sl.iter().map(|(k, v)| (*k, *v)).collect();
+        // 数量一致。
+        assert_eq!(collected.len(), keys.len());
+        // 全局非递减序。
+        assert!(collected.windows(2).all(|w| w[0].0 <= w[1].0));
+        // value 是 key 的两倍，逐对核对。
+        assert!(collected.iter().all(|(k, v)| *v == *k * 2));
+    }
+
+    #[test]
+    fn iterator_lists_all_duplicate_versions() {
+        let mut sl: SkipList<i32, i32> = SkipList::new();
+        sl.insert(5, 1);
+        sl.insert(5, 2);
+        sl.insert(5, 3);
+        // 同 key 后插入的排前面：find_prev 用严格 `<` 比较，遇到 == 即停，
+        // 新节点插在已有同 key 节点之前。这恰好是 LSM 想要的语义——
+        // 新版本（大 seq）排在前，查找时第一个命中即最新。Step 1.4 编码 seq
+        // 后这一行为会让大 seq 天然在前。
+        let vs: Vec<i32> = sl
+            .iter()
+            .filter(|(k, _)| *k == &5)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(vs, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn get_returns_latest_version_for_duplicate_keys() {
+        let mut sl: SkipList<i32, i32> = SkipList::new();
+        sl.insert(5, 1);
+        sl.insert(5, 2);
+        sl.insert(5, 3);
+        // 同 key 多版本时，get 返回最新的（排在最前的）那个。
+        assert_eq!(sl.get(&5), Some(&3));
     }
 }
