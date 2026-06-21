@@ -126,6 +126,27 @@ impl<K: Ord, V> SkipList<K, V> {
         }
     }
 
+    /// 返回第一个 key >= target 的条目。范围查询的基础。
+    ///
+    /// 下降逻辑与 get 一致：停在前驱节点后，取底层后继即为第一个 >= target。
+    /// MemTable 的 get 用此方法 + 哨兵 key 定位 user_key 的最新版本。
+    pub fn lower_bound(&self, key: &K) -> Option<(&K, &V)> {
+        let mut cur: usize = Self::HEAD;
+        for level in (0..self.max_height).rev() {
+            while self.nodes[cur].next[level] != NIL
+                && self.nodes[self.nodes[cur].next[level]].key < *key
+            {
+                cur = self.nodes[cur].next[level];
+            }
+        }
+        let next = self.nodes[cur].next[0];
+        if next != NIL {
+            Some((&self.nodes[next].key, &self.nodes[next].value))
+        } else {
+            None
+        }
+    }
+
     /// 插入一个节点。允许重复 key（LSM 需要同一 user_key 的多个版本）。
     pub fn insert(&mut self, key: K, value: V) {
         let mut rng = rand::rng();
