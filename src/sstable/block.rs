@@ -215,6 +215,47 @@ impl<'a> Block<'a> {
         None
     }
 
+    /// lower_bound 查找：返回第一个 key >= target 的 entry 的 value。
+    /// 与 get 的区别：不要求 key 相等，只要 >= 即返回。
+    /// 供 SSTable index block 用——index 项的 key 是各 data block 的"最大 key"分隔符，
+    /// 查 target 时要找"第一个分隔符 >= target"对应的 data block，而非精确匹配。
+    pub fn lower_bound(
+        &self,
+        target: &[u8],
+        cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
+    ) -> Option<&'a [u8]> {
+        // 二分 restart points：找第一个 restart_point_key >= target 的区间起点。
+        let mut lo = 0usize;
+        let mut hi = self.num_restarts;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let restart_key = self.restarting_key_at(mid)?;
+            match cmp(target, &restart_key) {
+                std::cmp::Ordering::Greater => lo = mid + 1,
+                // target <= restart_key：答案可能在 mid 或更早。
+                _ => hi = mid,
+            }
+        }
+        // lo 是第一个 restart_key >= target 的 restart index；若 lo==0 从头扫，否则从 lo-1 开始。
+        let start_restart = lo.saturating_sub(1).min(self.num_restarts - 1);
+        let mut offset = self.restart_offset(start_restart);
+        let mut last_key = self.restarting_key_at(start_restart)?;
+        while let Some(entry) = self.parse_entry(offset, &last_key) {
+            match cmp(target, &entry.key) {
+                std::cmp::Ordering::Greater => {
+                    offset = entry.next_offset;
+                    last_key = entry.key;
+                    if self.is_past_entries(offset) {
+                        return None;
+                    }
+                }
+                // target <= entry.key：这是第一个 >= target 的 entry。
+                _ => return Some(entry.value),
+            }
+        }
+        None
+    }
+
     /// 解析 restart point i 处的 entry 的 key（restart point 的 shared=0，key=key_delta）。
     fn restarting_key_at(&self, i: usize) -> Option<Vec<u8>> {
         let offset = self.restart_offset(i);
@@ -477,5 +518,60 @@ mod tests {
         for (k, v) in &entries {
             assert_eq!(block.get(k, &byte_cmp), Some(v.as_slice()));
         }
+    }
+
+    #[test]
+    fn lower_bound_returns_first_ge() {
+        let entries: Vec<(&[u8], &[u8])> = vec![
+            (b"apple", b"1"),
+            (b"banana", b"2"),
+            (b"cherry", b"3"),
+            (b"date", b"4"),
+        ];
+        let bytes = build_block(&entries);
+        let block = Block::new(&bytes).unwrap();
+        // 精确命中：lower_bound == 该 key 的 value。
+        assert_eq!(
+            block.lower_bound(b"banana", &byte_cmp),
+            Some(b"2".as_slice())
+        );
+        // 区间内：lower_bound("blue") 返回 "cherry"（第一个 >= "blue"）。
+        assert_eq!(block.lower_bound(b"blue", &byte_cmp), Some(b"3".as_slice()));
+        // 小于所有 key：返回第一个 key 的 value。
+        assert_eq!(
+            block.lower_bound(b"aardvark", &byte_cmp),
+            Some(b"1".as_slice())
+        );
+        // 大于所有 key：返回 None。
+        assert_eq!(block.lower_bound(b"zebra", &byte_cmp), None);
+    }
+
+    #[test]
+    fn lower_bound_across_restart_boundary() {
+        // 足够多的 key 让 lower_bound 跨 restart point。
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..50u32)
+            .map(|i| {
+                (
+                    format!("key{i:03}").into_bytes(),
+                    format!("v{i}").into_bytes(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&[u8], &[u8])> = entries
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let bytes = build_block(&refs);
+        let block = Block::new(&bytes).unwrap();
+        // 区间内：lower_bound("key024a") 返回 key025（第一个 >= "key024a"）。
+        assert_eq!(
+            block.lower_bound(b"key024a", &byte_cmp),
+            Some(b"v25".as_slice())
+        );
+        // 精确命中。
+        assert_eq!(
+            block.lower_bound(b"key032", &byte_cmp),
+            Some(b"v32".as_slice())
+        );
     }
 }
