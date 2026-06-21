@@ -241,10 +241,12 @@ impl TableReader {
         })
     }
 
-    /// 按 user_key 查找最新版本。
+    /// 按 user_key 查找最新版本的 (vtype, value)。命中时返回两者；未命中返回 None。
     /// 流程：布隆过滤 → 哨兵 internal key → index 定位 data block → block 内 lower_bound → 校验 user_key。
-    pub fn get(&self, user_key: &[u8]) -> Option<&[u8]> {
-        use crate::internal_key::{internal_key_cmp, lookup_key, user_key_of_internal_key};
+    pub fn get_entry(&self, user_key: &[u8]) -> Option<(crate::internal_key::ValueType, &[u8])> {
+        use crate::internal_key::{
+            internal_key_cmp, lookup_key, user_key_of_internal_key, vtype_of_internal_key,
+        };
         // 布隆过滤：user_key 肯定不在则直接返回 None，省掉读 data block。
         if let Some(bloom) = &self.bloom {
             if !bloom.may_contain(user_key) {
@@ -265,9 +267,19 @@ impl TableReader {
         let (found_key, value) =
             data_block.lower_bound_kv(&lookup, &|a, b| internal_key_cmp(a, b))?;
         if user_key_of_internal_key(&found_key) == user_key {
-            Some(value)
+            Some((vtype_of_internal_key(&found_key), value))
         } else {
             None
+        }
+    }
+
+    /// 按 user_key 查找最新版本。删除标记视为不存在（返回 None）。
+    pub fn get(&self, user_key: &[u8]) -> Option<&[u8]> {
+        let (vtype, value) = self.get_entry(user_key)?;
+        if vtype == crate::internal_key::ValueType::Delete {
+            None
+        } else {
+            Some(value)
         }
     }
 
@@ -449,8 +461,13 @@ mod tests {
         builder.finish().unwrap();
 
         let reader = TableReader::open(&path).unwrap();
-        // k1 最新版本是 Delete（value 空），SSTable 返回空切片。
-        assert_eq!(reader.get(b"k1"), Some(&b""[..]));
+        // k1 最新版本是 Delete：get 返回 None（删除标记由上层解释为不存在），
+        // get_entry 暴露 (Delete, 空) 以证明标记确实被存储。
+        assert_eq!(reader.get(b"k1"), None);
+        assert_eq!(
+            reader.get_entry(b"k1").map(|(t, v)| (t, v.len())),
+            Some((ValueType::Delete, 0))
+        );
         // k2 最新是 Put v2。
         assert_eq!(reader.get(b"k2"), Some(b"v2".as_slice()));
     }
@@ -549,8 +566,12 @@ mod tests {
         let reader = TableReader::open(&path).unwrap();
         // key1 最新版本是 v1-updated。
         assert_eq!(reader.get(b"key1"), Some(b"v1-updated".as_slice()));
-        // key2 最新是删除标记，SSTable 层返回空切片（Delete 语义由上层 DB 解释）。
-        assert_eq!(reader.get(b"key2"), Some(&b""[..]));
+        // key2 最新是删除标记：get 返回 None，get_entry 暴露 (Delete, 空)。
+        assert_eq!(reader.get(b"key2"), None);
+        assert_eq!(
+            reader.get_entry(b"key2").map(|(t, v)| (t, v.len())),
+            Some((ValueType::Delete, 0))
+        );
         // key3 正常。
         assert_eq!(reader.get(b"key3"), Some(b"v3".as_slice()));
         // 不存在的 key。

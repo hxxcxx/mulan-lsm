@@ -133,6 +133,15 @@ fn seq_of_internal_key(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(seq_bytes)
 }
 
+/// 从 internal key 字节提取 vtype。无 footer 或 type 字节非法时返回 `Put`（保守缺省）。
+pub fn vtype_of_internal_key(bytes: &[u8]) -> ValueType {
+    if bytes.len() < FOOTER_LEN {
+        return ValueType::Put;
+    }
+    let vtype_byte = bytes[bytes.len() - TYPE_LEN];
+    ValueType::from_u8(vtype_byte).unwrap_or(ValueType::Put)
+}
+
 /// 构造查询用的哨兵 internal key 字节：`user_key + MAX_SEQUENCE 小端 + Put`。
 /// MAX_SEQUENCE 比所有真实 seq 大，故此 key 在同 user_key 下排最后（seq 降序下最大 seq 排最前，
 /// 但 lower_bound 找第一个 >= 哨兵——同 user_key 的真实 seq 都 < MAX，所以真实版本 > 哨兵？）
