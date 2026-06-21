@@ -1,15 +1,15 @@
-//! InternalKey：把 user_key 扩展成 `user_key + !seq + type`，用一段可比较字节
-//! 同时承载"多版本"和"删除"。
+//! InternalKey：把 user_key 扩展成 (user_key, seq, vtype)，用一个包装类型
+//! 同时承载"多版本"和"删除"。排序由手动实现的 Ord 决定，不依赖字节字典序。
 
 use crate::error::{MulanError, Result};
 
-/// InternalKey 末尾固定 9 字节：8 字节 sequence + 1 字节 type。
+/// 序列号最大值。原版保留 u64::MAX 作为查找哨兵，实际使用的 seq 上限比它小 1。
+pub const MAX_SEQUENCE: u64 = u64::MAX - 1;
+
+/// InternalKey 序列化后的末尾固定 9 字节：8 字节 sequence + 1 字节 type。
 const FOOTER_LEN: usize = 9;
 const SEQ_LEN: usize = 8;
 const TYPE_LEN: usize = 1;
-
-/// 序列号最大值。原版保留 u64::MAX 作为查找哨兵，实际使用的 seq 上限比它小 1。
-pub const MAX_SEQUENCE: u64 = u64::MAX - 1;
 
 /// 写入操作的类型。Delete 不是真删除，而是写入一个删除标记。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,64 +29,99 @@ impl ValueType {
     }
 }
 
-/// 解析后的 InternalKey，零拷贝引用原字节。
-#[derive(Debug, PartialEq, Eq)]
-pub struct ParsedInternalKey<'a> {
-    pub user_key: &'a [u8],
+/// InternalKey 包装类型。排序规则（手动 Ord）：
+///   1. user_key 字节字典序升序
+///   2. 同 user_key 下 seq 降序（大 seq 在前，让最新版本最先被查找命中）
+///   3. seq 也相同时按 vtype 排序（理论不发生，仅为 Ord 全序完备）
+///
+/// 排序完全由 Ord 决定，seq 的字节布局（encode 时用小端）不参与排序。
+#[derive(Clone, Debug)]
+pub struct InternalKey {
+    pub user_key: Vec<u8>,
     pub seq: u64,
     pub vtype: ValueType,
 }
 
-/// 构造 InternalKey 字节：`user_key + (!seq 小端) + type`。
-///
-/// seq 按位取反存储，是这套编码的核心技巧：
-/// `a > b` 当且仅当 `!a < !b`，所以"大 seq"取反后在字节序上变小，天然排在前。
-/// 这样同一 user_key 的新版本自动排前，查找时第一个命中即最新，
-/// 且整个 key 可直接用字节字典序比较，无需自定义比较器。
-pub fn make(user_key: &[u8], seq: u64, vtype: ValueType) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(user_key.len() + FOOTER_LEN);
-    buf.extend_from_slice(user_key);
-    buf.extend_from_slice(&(!seq).to_le_bytes());
-    buf.push(vtype as u8);
-    buf
+impl InternalKey {
+    pub fn new(user_key: Vec<u8>, seq: u64, vtype: ValueType) -> Self {
+        InternalKey {
+            user_key,
+            seq,
+            vtype,
+        }
+    }
+
+    /// 序列化为字节：`user_key + seq(小端) + type`。
+    /// 仅供 WAL/SSTable 持久化用；排序由 Ord 决定，与此字节布局无关。
+    /// 字节序选小端仅为惯例（与 WAL/SSTable 的整数一致），不影响正确性。
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.user_key.len() + FOOTER_LEN);
+        buf.extend_from_slice(&self.user_key);
+        buf.extend_from_slice(&self.seq.to_le_bytes());
+        buf.push(self.vtype as u8);
+        buf
+    }
+
+    /// 反序列化。返回拥有的 InternalKey。
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < FOOTER_LEN {
+            return Err(MulanError::Corrupted(format!(
+                "internal key too short: {} bytes",
+                bytes.len()
+            )));
+        }
+        let user_key = bytes[..bytes.len() - FOOTER_LEN].to_vec();
+        let seq_bytes: [u8; SEQ_LEN] = bytes[bytes.len() - FOOTER_LEN..bytes.len() - TYPE_LEN]
+            .try_into()
+            .map_err(|_| MulanError::Corrupted("seq slice mismatch".into()))?;
+        let vtype_byte = bytes[bytes.len() - TYPE_LEN];
+        let vtype = ValueType::from_u8(vtype_byte).ok_or_else(|| {
+            MulanError::Corrupted(format!("unknown value type byte: {vtype_byte}"))
+        })?;
+        Ok(InternalKey {
+            user_key,
+            seq: u64::from_le_bytes(seq_bytes),
+            vtype,
+        })
+    }
 }
 
-/// 返回 InternalKey 中的 user_key 部分（截掉末尾 9 字节）。
-/// 长度不足时返回 Corrupted 错误。
-pub fn user_key(internal_key: &[u8]) -> Result<&[u8]> {
-    if internal_key.len() < FOOTER_LEN {
-        return Err(MulanError::Corrupted(format!(
-            "internal key too short: {} bytes",
-            internal_key.len()
-        )));
+impl PartialEq for InternalKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.user_key == other.user_key && self.seq == other.seq && self.vtype == other.vtype
     }
-    Ok(&internal_key[..internal_key.len() - FOOTER_LEN])
 }
 
-/// 解析 InternalKey 的全部字段。user_key 零拷贝引用输入字节。
-pub fn parse(internal_key: &[u8]) -> Result<ParsedInternalKey<'_>> {
-    if internal_key.len() < FOOTER_LEN {
-        return Err(MulanError::Corrupted(format!(
-            "internal key too short: {} bytes",
-            internal_key.len()
-        )));
+impl Eq for InternalKey {}
+
+impl Default for InternalKey {
+    fn default() -> Self {
+        // 跳表 head 的占位 key，永不参与比较。
+        InternalKey::new(Vec::new(), 0, ValueType::Put)
     }
-    let user_key = &internal_key[..internal_key.len() - FOOTER_LEN];
-    let seq_bytes: [u8; SEQ_LEN] = internal_key
-        [internal_key.len() - FOOTER_LEN..internal_key.len() - TYPE_LEN]
-        .try_into()
-        .map_err(|_| MulanError::Corrupted("seq slice mismatch".into()))?;
-    let vtype_byte = internal_key[internal_key.len() - TYPE_LEN];
-    let vtype = ValueType::from_u8(vtype_byte)
-        .ok_or_else(|| MulanError::Corrupted(format!("unknown value type byte: {vtype_byte}")))?;
-    // 构造时写入的是 !seq 的小端字节；这里逆操作：读出后按位取反还原 seq。
-    let seq_inverted = u64::from_le_bytes(seq_bytes);
-    let seq = !seq_inverted;
-    Ok(ParsedInternalKey {
-        user_key,
-        seq,
-        vtype,
-    })
+}
+
+impl PartialOrd for InternalKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for InternalKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // 先按 user_key 字节字典序。
+        match self.user_key.cmp(&other.user_key) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+        // 同 user_key 下 seq 降序：reverse 让大 seq 在前。
+        match self.seq.cmp(&other.seq).reverse() {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+        // seq 相同时按 vtype（数值序）兜底，保证全序。
+        (self.vtype as u8).cmp(&(other.vtype as u8))
+    }
 }
 
 #[cfg(test)]
@@ -94,60 +129,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn make_parse_round_trip() {
+    fn encode_decode_round_trip() {
         for (user_key, seq, vtype) in [
             (b"k1" as &[u8], 0u64, ValueType::Put),
             (b"hello", 42u64, ValueType::Delete),
             (b"", MAX_SEQUENCE, ValueType::Put),
             (&[0u8, 255, 7], 1, ValueType::Delete),
         ] {
-            let bytes = make(user_key, seq, vtype);
-            let parsed = parse(&bytes).unwrap();
-            assert_eq!(parsed.user_key, user_key);
-            assert_eq!(parsed.seq, seq);
-            assert_eq!(parsed.vtype, vtype);
+            let ik = InternalKey::new(user_key.to_vec(), seq, vtype);
+            let decoded = InternalKey::decode(&ik.encode()).unwrap();
+            assert_eq!(ik, decoded);
         }
     }
 
     #[test]
     fn larger_seq_sorts_before_smaller() {
-        // 同一 user_key，大 seq 的 internal key 在字节序上更小（排前面）。
-        let k_high = make(b"key", 100, ValueType::Put);
-        let k_low = make(b"key", 5, ValueType::Put);
-        assert!(k_high < k_low, "seq=100 should sort before seq=5");
+        // 同 user_key，大 seq 排前（cmp 返回 Greater 表示 self 在 other 之后）。
+        let high = InternalKey::new(b"key".to_vec(), 100, ValueType::Put);
+        let low = InternalKey::new(b"key".to_vec(), 5, ValueType::Put);
+        assert!(high < low, "seq=100 should sort before seq=5");
+    }
+
+    #[test]
+    fn cross_byte_boundary_seq_255_256() {
+        // 关键跨边界测试：seq=255 和 256 在小端字节下低字节从 0xFF 跳到 0x00，
+        // 这是原取反方案崩溃的边界。Ord 方案必须正确处理。
+        let s255 = InternalKey::new(b"k".to_vec(), 255, ValueType::Put);
+        let s256 = InternalKey::new(b"k".to_vec(), 256, ValueType::Put);
+        assert!(s256 < s255, "seq=256 should sort before seq=255");
+        // 再验证 encode 后不参与排序：即便字节布局"乱"，Ord 仍正确。
+        assert!(
+            InternalKey::decode(&s256.encode()).unwrap()
+                < InternalKey::decode(&s255.encode()).unwrap()
+        );
+    }
+
+    #[test]
+    fn seq_zero_vs_max() {
+        let zero = InternalKey::new(b"k".to_vec(), 0, ValueType::Put);
+        let max = InternalKey::new(b"k".to_vec(), MAX_SEQUENCE, ValueType::Put);
+        assert!(max < zero, "MAX_SEQUENCE should sort before 0");
     }
 
     #[test]
     fn different_user_keys_in_lexicographic_order() {
-        let a = make(b"apple", 9, ValueType::Put);
-        let b = make(b"banana", 1, ValueType::Put);
+        let a = InternalKey::new(b"apple".to_vec(), 9, ValueType::Put);
+        let b = InternalKey::new(b"banana".to_vec(), 1, ValueType::Put);
         assert!(a < b, "apple should sort before banana");
     }
 
     #[test]
-    fn user_key_extraction_ignores_footer() {
-        let bytes = make(b"mykey", 7, ValueType::Delete);
-        assert_eq!(user_key(&bytes).unwrap(), b"mykey");
+    fn decode_rejects_too_short_input() {
+        assert!(InternalKey::decode(b"").is_err());
+        assert!(InternalKey::decode(b"short").is_err());
+        assert!(InternalKey::decode(&[0u8; 8]).is_err());
     }
 
     #[test]
-    fn parse_rejects_too_short_input() {
-        assert!(parse(b"").is_err());
-        assert!(parse(b"short").is_err());
-        assert!(parse(&[0u8; 8]).is_err());
-    }
-
-    #[test]
-    fn parse_rejects_unknown_value_type() {
-        let mut bytes = make(b"k", 1, ValueType::Put);
-        // 篡改 type 字节为非法值。
+    fn decode_rejects_unknown_value_type() {
+        let mut bytes = InternalKey::new(b"k".to_vec(), 1, ValueType::Put).encode();
         *bytes.last_mut().unwrap() = 99;
-        assert!(parse(&bytes).is_err());
+        assert!(InternalKey::decode(&bytes).is_err());
     }
 
     #[test]
     fn delete_encodes_as_type_one() {
-        let bytes = make(b"k", 1, ValueType::Delete);
+        let bytes = InternalKey::new(b"k".to_vec(), 1, ValueType::Delete).encode();
         assert_eq!(*bytes.last().unwrap(), 1);
     }
 }

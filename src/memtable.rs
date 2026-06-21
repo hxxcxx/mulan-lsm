@@ -1,15 +1,15 @@
 //! MemTable：LSM 的可写内存层。
 //!
-//! 内部是一个跳表，key 存 internal key 字节（user_key + !seq + type），
+//! 内部是一个跳表，key 存 InternalKey（user_key + seq + vtype），
 //! value 存用户 value 字节。put 和 delete 都是"追加一个版本"，不原地修改。
 
 use crate::error::Result;
-use crate::internal_key::{self, ValueType, MAX_SEQUENCE};
+use crate::internal_key::{InternalKey, ValueType, MAX_SEQUENCE};
 use crate::skiplist::SkipList;
 
 /// LSM 的内存表。所有写入先落到这里，攒满后刷成 SSTable。
 pub struct MemTable {
-    skiplist: SkipList<Vec<u8>, Vec<u8>>,
+    skiplist: SkipList<InternalKey, Vec<u8>>,
     seq: u64,
 }
 
@@ -29,8 +29,8 @@ impl MemTable {
     /// 写入一个键值对。每次写都分配一个新的 seq，作为独立版本插入跳表。
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         self.seq += 1;
-        let internal_key = internal_key::make(key, self.seq, ValueType::Put);
-        self.skiplist.insert(internal_key, value.to_vec());
+        let ik = InternalKey::new(key.to_vec(), self.seq, ValueType::Put);
+        self.skiplist.insert(ik, value.to_vec());
     }
 
     /// 删除一个键：写入一个删除标记（type=Delete），而非物理移除。
@@ -38,29 +38,28 @@ impl MemTable {
     /// 删除不存在的 key 也是合法的——只是追加一个删除标记。
     pub fn delete(&mut self, key: &[u8]) {
         self.seq += 1;
-        let internal_key = internal_key::make(key, self.seq, ValueType::Delete);
+        let ik = InternalKey::new(key.to_vec(), self.seq, ValueType::Delete);
         // 删除标记的 value 为空。
-        self.skiplist.insert(internal_key, Vec::new());
+        self.skiplist.insert(ik, Vec::new());
     }
 
     /// 读取 key 的最新版本。返回值克隆一份交给调用方拥有。
     ///
-    /// 用哨兵技巧定位：构造 lookup_key = make(key, MAX_SEQUENCE, ...)，
-    /// 由于"大 seq 在前"，它排在 key 所有真实版本的最前面。
-    /// 取跳表中第一个 >= lookup_key 的条目，若其 user_key == key 即命中，
-    /// 再按 type 决定是返回 value 还是 NotFound。
+    /// 哨兵技巧：构造 InternalKey(key, MAX_SEQUENCE)，任何真实 seq 都比它小。
+    /// 由 Ord 定义，同 user_key 下大 seq 在前，故 lower_bound(哨兵) 命中的
+    /// 第一个条目就是该 user_key 的最新版本（若存在）。
+    /// 再校验命中条目的 user_key 是否相等，按 vtype 决定返回 value 还是 None。
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let lookup_key = internal_key::make(key, MAX_SEQUENCE, ValueType::Put);
-        let Some((internal_key_bytes, value)) = self.skiplist.lower_bound(&lookup_key) else {
-            // 跳表里没有任何 >= lookup_key 的条目，key 从未写过。
+        let lookup = InternalKey::new(key.to_vec(), MAX_SEQUENCE, ValueType::Put);
+        let Some((ik, value)) = self.skiplist.lower_bound(&lookup) else {
+            // 跳表里没有任何 >= 哨兵的条目，key 从未写过。
             return Ok(None);
         };
-        let parsed = internal_key::parse(internal_key_bytes)?;
-        if parsed.user_key != key {
-            // 第一个 >= lookup_key 的条目属于别的 user_key，本 key 未写过。
+        if ik.user_key != key {
+            // 第一个 >= 哨兵的条目属于别的 user_key，本 key 未写过。
             return Ok(None);
         }
-        match parsed.vtype {
+        match ik.vtype {
             ValueType::Put => Ok(Some(value.clone())),
             ValueType::Delete => Ok(None),
         }
@@ -76,6 +75,8 @@ impl Default for MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
 
     #[test]
     fn put_then_get() {
@@ -105,7 +106,6 @@ mod tests {
     #[test]
     fn delete_missing_key_is_idempotent() {
         let mut m = MemTable::new();
-        // 删除不存在的 key 不报错。
         m.delete(b"never_existed");
         assert_eq!(m.get(b"never_existed").unwrap(), None);
     }
@@ -116,7 +116,6 @@ mod tests {
         m.put(b"k", b"v1");
         m.put(b"k", b"v2");
         m.put(b"k", b"v3");
-        // get 返回最新版本 v3。
         assert_eq!(m.get(b"k").unwrap(), Some(b"v3".to_vec()));
     }
 
@@ -125,7 +124,6 @@ mod tests {
         let mut m = MemTable::new();
         m.put(b"k", b"v1");
         m.delete(b"k");
-        // 重新写入后又能读到。
         m.put(b"k", b"v2");
         assert_eq!(m.get(b"k").unwrap(), Some(b"v2".to_vec()));
     }
@@ -152,5 +150,87 @@ mod tests {
         assert_eq!(m.sequence(), 2);
         m.put(b"c", b"3");
         assert_eq!(m.sequence(), 3);
+    }
+
+    /// 跨边界回归测试：曾经 1.4 的取反方案在 seq=255 处崩溃。
+    /// 这里连续 put 到 seq 远超 255，证明 Ord 方案正确。
+    #[test]
+    fn get_works_across_seq_byte_boundary() {
+        let mut m = MemTable::new();
+        // put 300 个不同 key，seq 从 1 到 300，跨越 255 边界。
+        for i in 0..300u32 {
+            m.put(&i.to_be_bytes(), format!("v{i}").as_bytes());
+        }
+        for i in 0..300u32 {
+            let expected = Some(format!("v{i}").into_bytes());
+            assert_eq!(
+                m.get(&i.to_be_bytes()).unwrap(),
+                expected,
+                "failed at i={i}"
+            );
+        }
+    }
+
+    /// 差分测试：同样操作序列同时跑 MemTable 和 HashMap（参照实现），
+    /// 逐条比对 get 结果。覆盖反复写、删后复活、跨 seq 边界等。
+    #[test]
+    fn differential_against_hashmap() {
+        const OPS: usize = 5_000;
+        const KEY_SPACE: usize = 200;
+        let mut m = MemTable::new();
+        let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+            std::collections::HashMap::new();
+        // 固定种子，保证失败可复现。
+        let mut rng = StdRng::seed_from_u64(42);
+        for i in 0..OPS {
+            let key = (rng.random_range(0..KEY_SPACE) as u32)
+                .to_be_bytes()
+                .to_vec();
+            if rng.random_range(0..3) == 0 {
+                m.delete(&key);
+                model.remove(&key);
+            } else {
+                let val = format!("v{}", rng.random_range(0..100_000)).into_bytes();
+                m.put(&key, &val);
+                model.insert(key.clone(), val);
+            }
+            let got = m.get(&key).unwrap();
+            let expected = model.get(&key).cloned();
+            assert_eq!(got, expected, "mismatch at op {i} on key {key:?}");
+        }
+        // 全量校验 model 中每个 key 的状态。
+        for key in model.keys() {
+            assert_eq!(m.get(key).unwrap(), model.get(key).cloned());
+        }
+    }
+
+    #[test]
+    #[ignore = "10万级差分压测，cargo test -- --ignored 运行"]
+    fn stress_differential_hundred_thousand() {
+        const OPS: usize = 100_000;
+        const KEY_SPACE: usize = 5_000;
+        let mut m = MemTable::new();
+        let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+            std::collections::HashMap::new();
+        let mut rng = StdRng::seed_from_u64(7);
+        for i in 0..OPS {
+            let key = (rng.random_range(0..KEY_SPACE) as u32)
+                .to_be_bytes()
+                .to_vec();
+            if rng.random_range(0..4) == 0 {
+                m.delete(&key);
+                model.remove(&key);
+            } else {
+                let val = format!("v{i}").into_bytes();
+                m.put(&key, &val);
+                model.insert(key.clone(), val);
+            }
+            if i % 1000 == 0 {
+                let probe = (rng.random_range(0..KEY_SPACE) as u32)
+                    .to_be_bytes()
+                    .to_vec();
+                assert_eq!(m.get(&probe).unwrap(), model.get(&probe).cloned());
+            }
+        }
     }
 }

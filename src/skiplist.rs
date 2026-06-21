@@ -321,4 +321,82 @@ mod tests {
         // 同 key 多版本时，get 返回最新的（排在最前的）那个。
         assert_eq!(sl.get(&5), Some(&3));
     }
+
+    #[test]
+    fn sequential_insert_all_queryable_and_sorted() {
+        const N: i32 = 10_000;
+        let mut sl: SkipList<i32, i32> = SkipList::new();
+        for k in 0..N {
+            sl.insert(k, k * 2);
+        }
+        // 全查询命中，且值正确。
+        for k in 0..N {
+            assert_eq!(sl.get(&k), Some(&(k * 2)), "missed key {k}");
+        }
+        // 不存在的 key 返回 None。
+        assert_eq!(sl.get(&N), None);
+        // 底层严格升序。
+        let mut cur = SkipList::<i32, i32>::HEAD;
+        let mut prev = -1;
+        let mut count = 0;
+        while sl.nodes[cur].next[0] != NIL {
+            cur = sl.nodes[cur].next[0];
+            assert!(sl.nodes[cur].key > prev);
+            prev = sl.nodes[cur].key;
+            count += 1;
+        }
+        assert_eq!(count, N as usize);
+    }
+
+    #[test]
+    fn random_insert_all_queryable_and_sorted() {
+        const N: usize = 10_000;
+        let mut sl: SkipList<i32, i32> = SkipList::new();
+        let mut rng = rand::rng();
+        let mut keys: Vec<i32> = (0..N as i32)
+            .map(|_| rng.random_range(0..1_000_000))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        for &k in &keys {
+            sl.insert(k, k * 2);
+        }
+        // 全查询命中。
+        for &k in &keys {
+            assert_eq!(sl.get(&k), Some(&(k * 2)));
+        }
+        // 底层有序。
+        let collected: Vec<i32> = sl.iter().map(|(k, _)| *k).collect();
+        assert!(collected.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(collected.len(), keys.len());
+    }
+
+    #[test]
+    #[ignore = "10万级压测，cargo test -- --ignored 运行"]
+    fn stress_hundred_thousand_random_keys() {
+        const N: usize = 100_000;
+        let mut sl: SkipList<i32, i32> = SkipList::new();
+        let mut rng = rand::rng();
+        let keys: Vec<i32> = (0..N as i32)
+            .map(|_| rng.random_range(0..1_000_000))
+            .collect();
+        for &k in &keys {
+            sl.insert(k, k);
+        }
+        // 全查询命中。
+        for &k in &keys {
+            assert_eq!(sl.get(&k), Some(&k));
+        }
+        // 底层全局有序。
+        let mut cur = SkipList::<i32, i32>::HEAD;
+        let mut prev = i32::MIN;
+        let mut count = 0;
+        while sl.nodes[cur].next[0] != NIL {
+            cur = sl.nodes[cur].next[0];
+            assert!(sl.nodes[cur].key >= prev);
+            prev = sl.nodes[cur].key;
+            count += 1;
+        }
+        assert_eq!(count, N);
+    }
 }
