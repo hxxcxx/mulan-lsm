@@ -55,6 +55,20 @@ impl MemTable {
         }
     }
 
+    /// 把 MemTable 的全部内容刷成一个 SSTable 文件。
+    /// 遍历内部跳表（按 InternalKey Ord 有序），每条写入 TableBuilder。
+    /// 返回写入的 entry 数。
+    pub fn flush_to_sstable(&self, path: &std::path::Path) -> crate::error::Result<u64> {
+        let file = std::fs::File::create(path)?;
+        let mut builder = crate::sstable::TableBuilder::new(file);
+        for (ik, value) in self.skiplist.iter() {
+            builder.add(&ik.user_key, &ik.encode(), value)?;
+        }
+        let n = builder.num_entries();
+        builder.finish()?;
+        Ok(n)
+    }
+
     /// 读取 key 的最新版本。返回值克隆一份交给调用方拥有。
     ///
     /// 哨兵技巧：构造 InternalKey(key, MAX_SEQUENCE)，任何真实 seq 都比它小。

@@ -84,47 +84,6 @@ impl InternalKey {
             vtype,
         })
     }
-
-    /// 排序键编码：`user_key + (!seq 大端 8 字节) + type`。
-    ///
-    /// 专供 Block/SSTable 用——保证 sort_key 的字节字典序 == InternalKey 的 Ord：
-    /// - user_key 字典序（Ord 第一关键字）
-    /// - !seq 大端：大端下字节序 == 整数序，取反让"大 seq → 小字节序"，即同 user_key 下大 seq 在前（Ord 第二关键字降序）
-    /// - type 占位（seq 唯一时不影响排序）
-    ///
-    /// 与 encode()（小端，WAL 用）职责分离，不可混用。详见 docs/plan.md 设计约束 #1。
-    pub fn sort_key(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.user_key.len() + FOOTER_LEN);
-        buf.extend_from_slice(&self.user_key);
-        buf.extend_from_slice(&(!self.seq).to_be_bytes());
-        buf.push(self.vtype as u8);
-        buf
-    }
-
-    /// 从 sort_key 还原 InternalKey。
-    pub fn from_sort_key(sort_key: &[u8]) -> Result<Self> {
-        if sort_key.len() < FOOTER_LEN {
-            return Err(MulanError::Corrupted(format!(
-                "sort key too short: {} bytes",
-                sort_key.len()
-            )));
-        }
-        let user_key = sort_key[..sort_key.len() - FOOTER_LEN].to_vec();
-        let seq_bytes: [u8; SEQ_LEN] = sort_key
-            [sort_key.len() - FOOTER_LEN..sort_key.len() - TYPE_LEN]
-            .try_into()
-            .map_err(|_| MulanError::Corrupted("sort key seq slice mismatch".into()))?;
-        let vtype_byte = sort_key[sort_key.len() - TYPE_LEN];
-        let vtype = ValueType::from_u8(vtype_byte).ok_or_else(|| {
-            MulanError::Corrupted(format!("unknown value type byte in sort key: {vtype_byte}"))
-        })?;
-        Ok(InternalKey {
-            user_key,
-            // 写入时是 !seq 大端，读出大端值后取反还原。
-            seq: !u64::from_be_bytes(seq_bytes),
-            vtype,
-        })
-    }
 }
 
 impl PartialEq for InternalKey {
@@ -134,6 +93,57 @@ impl PartialEq for InternalKey {
 }
 
 impl Eq for InternalKey {}
+
+/// internal key 字节比较器：按 InternalKey Ord 比较（user_key 字典序升序；同 user_key 下 seq 降序）。
+///
+/// 输入是 encode() 产生的字节（`user_key + seq 小端 + type`）。
+/// 先比较 user_key 字节字典序；user_key 相同时，比较 seq（小端整数）的**降序**——
+/// 大 seq 在前，让最新版本最先被查找命中。
+///
+/// 供 Block/SSTable 的查找用：Block 存 encode 字节，查找时用此闭包比较，
+/// 避免纯字节字典序在变长 user_key 前缀关系下的错乱（见 docs/plan.md 约束 #4）。
+pub fn internal_key_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let a_uk = user_key_of_internal_key(a);
+    let b_uk = user_key_of_internal_key(b);
+    match a_uk.cmp(b_uk) {
+        std::cmp::Ordering::Equal => {}
+        ord => return ord,
+    }
+    // 同 user_key：比 seq 降序。从 encode 末尾 9 字节解析 seq（小端）。
+    let a_seq = seq_of_internal_key(a);
+    let b_seq = seq_of_internal_key(b);
+    a_seq.cmp(&b_seq).reverse()
+}
+
+/// 从 internal key 字节提取 user_key（去掉末尾 seq 小端 8 字节 + type 1 字节）。
+pub fn user_key_of_internal_key(bytes: &[u8]) -> &[u8] {
+    if bytes.len() < FOOTER_LEN {
+        return bytes;
+    }
+    &bytes[..bytes.len() - FOOTER_LEN]
+}
+
+/// 从 internal key 字节提取 seq（小端）。无 footer 时返回 0。
+fn seq_of_internal_key(bytes: &[u8]) -> u64 {
+    if bytes.len() < FOOTER_LEN {
+        return 0;
+    }
+    let start = bytes.len() - FOOTER_LEN;
+    let seq_bytes: [u8; SEQ_LEN] = bytes[start..start + SEQ_LEN].try_into().unwrap();
+    u64::from_le_bytes(seq_bytes)
+}
+
+/// 构造查询用的哨兵 internal key 字节：`user_key + MAX_SEQUENCE 小端 + Put`。
+/// MAX_SEQUENCE 比所有真实 seq 大，故此 key 在同 user_key 下排最后（seq 降序下最大 seq 排最前，
+/// 但 lower_bound 找第一个 >= 哨兵——同 user_key 的真实 seq 都 < MAX，所以真实版本 > 哨兵？）
+///
+/// 注意：internal_key_cmp 中 seq 是降序，所以"大 seq"在 Ord 上更小。
+/// 哨兵 seq=MAX 是最大的，在同 user_key 下 Ord 最小（排最前）。
+/// lower_bound(哨兵) 找第一个 Ord >= 哨兵的 → 同 user_key 的所有真实版本都 Ord > 哨兵（seq 更小 → Ord 更大），
+/// 故命中的是 Ord 最小的真实版本 = seq 最大的最新版本 ✓。
+pub fn lookup_key(user_key: &[u8]) -> Vec<u8> {
+    InternalKey::new(user_key.to_vec(), MAX_SEQUENCE, ValueType::Put).encode()
+}
 
 impl Default for InternalKey {
     fn default() -> Self {
@@ -239,58 +249,44 @@ mod tests {
         assert_eq!(*bytes.last().unwrap(), 1);
     }
 
-    /// 核心不变量：sort_key 字节字典序 == InternalKey Ord。
-    /// 这是 SSTable/Block 用字节比较的合法性基础。违反则 SSTable 查找全错。
+    /// 核心不变量：InternalKey Ord 在各种 key 关系下的正确性。
+    /// 这是 SSTable 排序的合法性基础（Block 查找用 internal_key_cmp 按 Ord 比较）。
     #[test]
-    fn sort_key_byte_order_matches_ord() {
-        // 构造一组覆盖各种排序关系的 key 对。
+    fn internal_key_ord_correctness() {
         let cases: Vec<(InternalKey, InternalKey, &str)> = vec![
-            // 不同 user_key，字典序。
             (
                 InternalKey::new(b"apple".to_vec(), 5, ValueType::Put),
                 InternalKey::new(b"banana".to_vec(), 1, ValueType::Put),
                 "apple < banana",
             ),
-            // 同 user_key，大 seq 在前。
             (
                 InternalKey::new(b"k".to_vec(), 100, ValueType::Put),
                 InternalKey::new(b"k".to_vec(), 5, ValueType::Put),
-                "seq=100 < seq=5",
+                "seq=100 < seq=5 (降序)",
             ),
-            // 跨字节边界：seq=256（大端低字节变化处）。
             (
                 InternalKey::new(b"k".to_vec(), 256, ValueType::Put),
                 InternalKey::new(b"k".to_vec(), 255, ValueType::Put),
-                "seq=256 < seq=255",
+                "seq=256 < seq=255 跨字节边界",
             ),
-            // 极端：seq=0 vs MAX。
             (
                 InternalKey::new(b"k".to_vec(), MAX_SEQUENCE, ValueType::Put),
                 InternalKey::new(b"k".to_vec(), 0, ValueType::Put),
                 "seq=MAX < seq=0",
             ),
+            (
+                InternalKey::new(b"present-2".to_vec(), 1, ValueType::Put),
+                InternalKey::new(b"present-200".to_vec(), 1, ValueType::Put),
+                "前缀: present-2 < present-200",
+            ),
+            (
+                InternalKey::new(b"a".to_vec(), 1, ValueType::Put),
+                InternalKey::new(b"a\xFF".to_vec(), 1, ValueType::Put),
+                "前缀: 'a' < 'a'+0xFF",
+            ),
         ];
         for (a, b, desc) in cases {
-            let ord = a.cmp(&b);
-            let byte_ord = a.sort_key().cmp(&b.sort_key());
-            assert_eq!(
-                ord, byte_ord,
-                "{desc}: Ord={ord:?} but sort_key byte order={byte_ord:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn sort_key_round_trip() {
-        for (user_key, seq, vtype) in [
-            (b"k1" as &[u8], 0u64, ValueType::Put),
-            (b"k", 255u64, ValueType::Delete),
-            (b"long-user-key-123", 256u64, ValueType::Put),
-            (b"", MAX_SEQUENCE, ValueType::Put),
-        ] {
-            let ik = InternalKey::new(user_key.to_vec(), seq, vtype);
-            let restored = InternalKey::from_sort_key(&ik.sort_key()).unwrap();
-            assert_eq!(ik, restored);
+            assert!(a < b, "{desc}: expected a < b but got {:?}", a.cmp(&b));
         }
     }
 }

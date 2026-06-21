@@ -256,6 +256,42 @@ impl<'a> Block<'a> {
         None
     }
 
+    /// lower_bound 的变体：返回重建后的完整 key（owned）+ value 借用。
+    /// 前缀压缩下完整 key 不在 data 里连续存放，故 key 必须重建为 owned。
+    /// 供 TableReader 校验命中 entry 的 user_key。
+    pub fn lower_bound_kv(
+        &self,
+        target: &[u8],
+        cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
+    ) -> Option<(Vec<u8>, &'a [u8])> {
+        let mut lo = 0usize;
+        let mut hi = self.num_restarts;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let restart_key = self.restarting_key_at(mid)?;
+            match cmp(target, &restart_key) {
+                std::cmp::Ordering::Greater => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        let start_restart = lo.saturating_sub(1).min(self.num_restarts - 1);
+        let mut offset = self.restart_offset(start_restart);
+        let mut last_key = self.restarting_key_at(start_restart)?;
+        while let Some(entry) = self.parse_entry(offset, &last_key) {
+            match cmp(target, &entry.key) {
+                std::cmp::Ordering::Greater => {
+                    offset = entry.next_offset;
+                    last_key = entry.key;
+                    if self.is_past_entries(offset) {
+                        return None;
+                    }
+                }
+                _ => return Some((entry.key, entry.value)),
+            }
+        }
+        None
+    }
+
     /// 解析 restart point i 处的 entry 的 key（restart point 的 shared=0，key=key_delta）。
     fn restarting_key_at(&self, i: usize) -> Option<Vec<u8>> {
         let offset = self.restart_offset(i);
@@ -573,5 +609,99 @@ mod tests {
             block.lower_bound(b"key032", &byte_cmp),
             Some(b"v32".as_slice())
         );
+    }
+
+    /// 用 internal_key_cmp + 变长 user_key 的 encode 字节测试 lower_bound。
+    /// 这是 SSTable 实际场景：复现 "present-2" vs "present-200" 的前缀关系。
+    #[test]
+    fn lower_bound_with_internal_key_cmp_variable_user_key() {
+        use crate::internal_key::{
+            internal_key_cmp, lookup_key, user_key_of_internal_key, InternalKey, ValueType,
+        };
+
+        // 构造一组 internal key，含变长前缀关系 + 足够数量触发多个 restart point。
+        let mut iks: Vec<InternalKey> = vec![];
+        iks.push(InternalKey::new(b"present-2".to_vec(), 1, ValueType::Put));
+        iks.push(InternalKey::new(b"present-200".to_vec(), 1, ValueType::Put));
+        // present-199 是关键：字典序在 present-2 之前，但和 present-2 共享前缀 "present-"，
+        // present-2 又是 present-200 前缀。三者连续排列考验前缀压缩跨边界。
+        iks.push(InternalKey::new(b"present-199".to_vec(), 1, ValueType::Put));
+        for i in 0..50u32 {
+            iks.push(InternalKey::new(
+                format!("present-3-{i}").into_bytes(),
+                1,
+                ValueType::Put,
+            ));
+        }
+        iks.sort();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> =
+            iks.iter().map(|ik| (ik.encode(), b"v".to_vec())).collect();
+        let refs: Vec<(&[u8], &[u8])> = entries
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let bytes = build_block(&refs);
+        let block = Block::new(&bytes).unwrap();
+
+        // 先遍历，确认所有 entry 都能正确重建且有序。
+        let collected: Vec<Vec<u8>> = block
+            .iter()
+            .map(|(k, _)| user_key_of_internal_key(&k).to_vec())
+            .collect();
+        assert_eq!(
+            collected,
+            iks.iter().map(|ik| ik.user_key.clone()).collect::<Vec<_>>(),
+            "block iteration missing/misordered keys"
+        );
+
+        // lower_bound 查 present-2：哨兵 seq=MAX，应命中 present-2 的真实版本（而非 present-200）。
+        let lookup = lookup_key(b"present-2");
+        let (found_key, _v) = block
+            .lower_bound_kv(&lookup, &|a, b| internal_key_cmp(a, b))
+            .expect("lower_bound should hit something");
+        assert_eq!(
+            user_key_of_internal_key(&found_key),
+            b"present-2",
+            "lower_bound(present-2) hit wrong key"
+        );
+    }
+
+    /// 测 lower_bound（非 kv 版，index 路由用）在多 restart + 变长 internal key 下。
+    /// 这是 SSTable index 路由的实际场景。
+    #[test]
+    fn lower_bound_index_style_many_restarts_variable_keys() {
+        use crate::internal_key::{internal_key_cmp, lookup_key, InternalKey, ValueType};
+
+        // 50 个变长 key，触发多个 restart point（每 16 条一个）。
+        let mut iks: Vec<InternalKey> = vec![];
+        for i in 0..50u32 {
+            iks.push(InternalKey::new(
+                format!("present-{i}").into_bytes(),
+                1,
+                ValueType::Put,
+            ));
+        }
+        iks.sort();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> =
+            iks.iter().map(|ik| (ik.encode(), b"v".to_vec())).collect();
+        let refs: Vec<(&[u8], &[u8])> = entries
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let bytes = build_block(&refs);
+        let block = Block::new(&bytes).unwrap();
+
+        // 用 lookup_key 构造哨兵，测 lower_bound（返回 value）。
+        // index 场景里 value 是 BlockHandle；这里 value 是 b"v"，但逻辑一样。
+        for ik in &iks {
+            let lookup = lookup_key(&ik.user_key);
+            let found = block.lower_bound(&lookup, &|a, b| internal_key_cmp(a, b));
+            assert_eq!(
+                found,
+                Some(b"v".as_slice()),
+                "lower_bound missed {:?}",
+                ik.user_key
+            );
+        }
     }
 }

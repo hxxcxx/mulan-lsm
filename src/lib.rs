@@ -1,5 +1,6 @@
 //! mulan-lsm：Rust 实现的 LSM-Tree 键值存储。
 
+pub mod bloom;
 pub mod error;
 pub mod internal_key;
 pub mod memtable;
