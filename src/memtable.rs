@@ -43,6 +43,18 @@ impl MemTable {
         self.skiplist.insert(ik, Vec::new());
     }
 
+    /// 用指定的 seq 应用一条写操作（put 或 delete），不重新分配 seq。
+    /// 供 WAL 崩溃恢复回放使用——必须复用 record 里的原始 seq，
+    /// 否则跨崩溃后 seq 不连续，会破坏未来的 snapshot/MVCC 引用。
+    /// 同时把 seq 推进到 max(当前, record_seq)，保证后续写入继续递增。
+    pub fn apply(&mut self, vtype: ValueType, seq: u64, key: &[u8], value: &[u8]) {
+        let ik = InternalKey::new(key.to_vec(), seq, vtype);
+        self.skiplist.insert(ik, value.to_vec());
+        if seq > self.seq {
+            self.seq = seq;
+        }
+    }
+
     /// 读取 key 的最新版本。返回值克隆一份交给调用方拥有。
     ///
     /// 哨兵技巧：构造 InternalKey(key, MAX_SEQUENCE)，任何真实 seq 都比它小。

@@ -20,7 +20,7 @@ pub enum ValueType {
 }
 
 impl ValueType {
-    fn from_u8(v: u8) -> Option<Self> {
+    pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(ValueType::Put),
             1 => Some(ValueType::Delete),

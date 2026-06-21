@@ -298,6 +298,70 @@ impl WalReader {
     }
 }
 
+/// 解析后的 WAL entry：一条用户写操作（put 或 delete）。
+#[derive(Debug, PartialEq, Eq)]
+pub struct WalEntry {
+    pub vtype: crate::internal_key::ValueType,
+    pub seq: u64,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+/// 把一条写操作编码为 record 的 data 部分。
+///
+/// 布局：vtype(1) | seq(8, 小端) | key_len(varint) | key | val_len(varint) | val
+/// seq 直接落地（不取反），因为 WAL 不参与排序，只是顺序回放。
+/// Delete 的 value 编码为空（val_len=0）。
+pub fn encode_entry(
+    vtype: crate::internal_key::ValueType,
+    seq: u64,
+    key: &[u8],
+    value: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(9 + key.len() + value.len());
+    buf.push(vtype as u8);
+    buf.extend_from_slice(&seq.to_le_bytes());
+    crate::varint::encode_varint32(&mut buf, key.len() as u32);
+    buf.extend_from_slice(key);
+    crate::varint::encode_varint32(&mut buf, value.len() as u32);
+    buf.extend_from_slice(value);
+    buf
+}
+
+/// 解码一条 entry。返回拥有的 WalEntry。
+pub fn decode_entry(data: &[u8]) -> crate::error::Result<WalEntry> {
+    use crate::error::MulanError;
+    use crate::internal_key::ValueType;
+    if data.len() < 9 {
+        return Err(MulanError::Corrupted(format!(
+            "entry too short: {} bytes",
+            data.len()
+        )));
+    }
+    let vtype = ValueType::from_u8(data[0])
+        .ok_or_else(|| MulanError::Corrupted(format!("unknown value type: {}", data[0])))?;
+    let seq = u64::from_le_bytes(data[1..9].try_into().unwrap());
+    let (key_len, consumed_kl) = crate::varint::decode_varint32(&data[9..])?;
+    let key_end = 9 + consumed_kl + key_len as usize;
+    if key_end > data.len() {
+        return Err(MulanError::Corrupted("entry key out of bounds".into()));
+    }
+    let key = data[9 + consumed_kl..key_end].to_vec();
+    let (val_len, consumed_vl) = crate::varint::decode_varint32(&data[key_end..])?;
+    let val_start = key_end + consumed_vl;
+    let val_end = val_start + val_len as usize;
+    if val_end > data.len() {
+        return Err(MulanError::Corrupted("entry value out of bounds".into()));
+    }
+    let value = data[val_start..val_end].to_vec();
+    Ok(WalEntry {
+        vtype,
+        seq,
+        key,
+        value,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
