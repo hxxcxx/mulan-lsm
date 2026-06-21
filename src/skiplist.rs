@@ -301,9 +301,7 @@ mod tests {
         sl.insert(5, 2);
         sl.insert(5, 3);
         // 同 key 后插入的排前面：find_prev 用严格 `<` 比较，遇到 == 即停，
-        // 新节点插在已有同 key 节点之前。这恰好是 LSM 想要的语义——
-        // 新版本（大 seq）排在前，查找时第一个命中即最新。Step 1.4 编码 seq
-        // 后这一行为会让大 seq 天然在前。
+        // 新节点插在已有同 key 节点之前。LSM 依赖这一行为让大 seq 天然在前。
         let vs: Vec<i32> = sl
             .iter()
             .filter(|(k, _)| *k == &5)

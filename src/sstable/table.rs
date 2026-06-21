@@ -8,8 +8,9 @@
 //! [footer]            ← 固定长度，含 metaindex/index handle + magic
 //! ```
 //!
-//! data block / index block 都用 M3.1 的 Block 格式（纯字节 + 前缀压缩）。
-//! key 存的是 InternalKey 的 sort_key（保证字节字典序 == Ord）。
+//! data block / index block 都用 Block 格式（纯字节 + 前缀压缩）。
+//! key 存的是 InternalKey 的 encode 字节（user_key + seq 小端 + type），
+//! Block 的 get/lower_bound 用比较器闭包（按 InternalKey Ord 比较），不依赖字节字典序。
 
 use crate::error::{MulanError, Result};
 use crate::sstable::block::{Block, BlockBuilder};
@@ -192,6 +193,12 @@ impl TableBuilder {
     pub fn num_entries(&self) -> u64 {
         self.num_entries
     }
+
+    /// 当前已写到文件的字节 + 当前 data block 的估计大小。
+    /// 用于 compaction 判断是否该切输出文件。
+    pub fn current_size_estimate(&self) -> u64 {
+        self.file_offset + self.data_block.current_size_estimate() as u64
+    }
 }
 
 /// SSTable 读取器。打开文件后支持 get(user_key)。
@@ -283,6 +290,12 @@ impl TableReader {
         }
     }
 
+    /// 顺序遍历全表所有 (internal_key, value)，按 `internal_key_cmp` 升序。
+    /// 供 compaction 归并用——全量扫描，不走二分。
+    pub fn iter(&self) -> TableIter<'_> {
+        TableIter::new(self)
+    }
+
     /// 取一个 block 的字节切片。
     fn block_bytes(&self, handle: &BlockHandle) -> Result<&[u8]> {
         let start = handle.offset as usize;
@@ -296,6 +309,83 @@ impl TableReader {
             )));
         }
         Ok(&self.data[start..end])
+    }
+
+    /// 读 index block，解析出所有 data block 的 handle（按文件顺序）。
+    fn data_handles(&self) -> Result<Vec<BlockHandle>> {
+        let index_bytes = self.block_bytes(&self.index_handle)?;
+        let index_block = Block::new(index_bytes)?;
+        let mut handles = Vec::new();
+        for (_key, handle_bytes) in index_block.iter() {
+            let (h, _n) = BlockHandle::decode(handle_bytes)?;
+            handles.push(h);
+        }
+        Ok(handles)
+    }
+}
+
+/// SSTable 顺序迭代器：流式输出全表 (internal_key_bytes, value_bytes)。
+///
+/// 状态机：从 index 解析出所有 data block 的 handle，逐个 block 解析其全部 entry 到
+/// owned `Vec`，再顺序返回。block 仅 ~4KB，一次性解析开销可忽略，且彻底规避 `BlockIter`
+/// 借用临时 `Block` 的生命周期冲突。Block 内已按 `internal_key_cmp` 有序，index 按 data
+/// block 顺序，故全表输出严格按 `internal_key_cmp` 升序。
+pub struct TableIter<'a> {
+    reader: &'a TableReader,
+    handles: Vec<BlockHandle>,
+    handle_idx: usize,
+    /// 当前 data block 的所有 entry（已解析为 owned）。
+    current: Vec<(Vec<u8>, Vec<u8>)>,
+    current_pos: usize,
+}
+
+impl<'a> TableIter<'a> {
+    fn new(reader: &'a TableReader) -> Self {
+        // data_handles 失败时留空，next 会直接返回 None（损坏文件不产出条目）。
+        let handles = reader.data_handles().unwrap_or_default();
+        TableIter {
+            reader,
+            handles,
+            handle_idx: 0,
+            current: Vec::new(),
+            current_pos: 0,
+        }
+    }
+
+    /// 解析下一个 data block 的全部 entry 到 `current`。返回 false 表示已无 block。
+    fn advance_to_next_block(&mut self) -> bool {
+        while self.handle_idx < self.handles.len() {
+            let handle = self.handles[self.handle_idx];
+            self.handle_idx += 1;
+            if let Ok(bytes) = self.reader.block_bytes(&handle) {
+                if let Ok(block) = Block::new(bytes) {
+                    self.current = block.iter().map(|(k, v)| (k, v.to_vec())).collect();
+                    self.current_pos = 0;
+                    return true;
+                }
+            }
+            // block 损坏：跳过该 block 继续下一个（容错，与 LevelDB 一致）。
+        }
+        self.current.clear();
+        false
+    }
+}
+
+impl<'a> Iterator for TableIter<'a> {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current_pos < self.current.len() {
+                let item = self.current[self.current_pos].clone();
+                self.current_pos += 1;
+                return Some(item);
+            }
+            // 当前 block 耗尽，切下一个。
+            if !self.advance_to_next_block() {
+                return None;
+            }
+        }
     }
 }
 
@@ -576,5 +666,110 @@ mod tests {
         assert_eq!(reader.get(b"key3"), Some(b"v3".as_slice()));
         // 不存在的 key。
         assert_eq!(reader.get(b"key4"), None);
+    }
+
+    #[test]
+    fn table_iter_empty_table_ends_immediately() {
+        // 空 SSTable（无 entry）的迭代器应立即结束。
+        let path = tmp_path("iter_empty.sst");
+        let file = std::fs::File::create(&path).unwrap();
+        TableBuilder::new(file).finish().unwrap();
+        let reader = TableReader::open(&path).unwrap();
+        let collected: Vec<_> = reader.iter().collect();
+        assert!(collected.is_empty());
+    }
+
+    #[test]
+    fn table_iter_outputs_all_entries_in_order() {
+        // 单 data block：迭代器输出全部 entry，按 internal_key_cmp 升序。
+        let path = tmp_path("iter_small.sst");
+        let entries = ordered_entries(20, 10);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut builder = TableBuilder::new(file);
+        for (ik, value) in &entries {
+            builder.add(&ik.user_key, &ik.encode(), value).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = TableReader::open(&path).unwrap();
+        let collected: Vec<(Vec<u8>, Vec<u8>)> = reader.iter().collect();
+        assert_eq!(collected.len(), entries.len());
+        // 字节与写入一致（internal key 字节 + value）。
+        for (i, ((ik, value), (got_key, got_val))) in
+            entries.iter().zip(collected.iter()).enumerate()
+        {
+            assert_eq!(got_key, &ik.encode(), "key mismatch at {i}");
+            assert_eq!(got_val, value, "value mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn table_iter_crosses_data_block_boundary() {
+        // 多 data block：迭代器跨 block 连续输出，无遗漏/重复。
+        let path = tmp_path("iter_multi.sst");
+        let entries = ordered_entries(5_000, 1_000);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut builder = TableBuilder::new(file);
+        for (ik, value) in &entries {
+            builder.add(&ik.user_key, &ik.encode(), value).unwrap();
+        }
+        builder.finish().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > DATA_BLOCK_TARGET as u64);
+
+        let reader = TableReader::open(&path).unwrap();
+        let collected: Vec<_> = reader.iter().collect();
+        assert_eq!(
+            collected.len(),
+            entries.len(),
+            "no entries lost across blocks"
+        );
+        // 严格按 internal_key_cmp 升序。
+        for w in collected.windows(2) {
+            assert!(
+                crate::internal_key::internal_key_cmp(&w[0].0, &w[1].0)
+                    != std::cmp::Ordering::Greater,
+                "entries not in ascending order"
+            );
+        }
+    }
+
+    #[test]
+    fn table_iter_preserves_delete_and_multi_version() {
+        // 迭代器输出所有版本（含 Delete 标记和旧版本），不做去重——去重是 MergingIterator 的职责。
+        let path = tmp_path("iter_versions.sst");
+        let mut entries = vec![
+            (
+                InternalKey::new(b"k".to_vec(), 1, ValueType::Put),
+                b"v1".to_vec(),
+            ),
+            (
+                InternalKey::new(b"k".to_vec(), 2, ValueType::Delete),
+                Vec::new(),
+            ),
+            (
+                InternalKey::new(b"k".to_vec(), 3, ValueType::Put),
+                b"v3".to_vec(),
+            ),
+        ];
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut builder = TableBuilder::new(file);
+        for (ik, value) in &entries {
+            builder.add(&ik.user_key, &ik.encode(), value).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = TableReader::open(&path).unwrap();
+        let collected: Vec<_> = reader.iter().collect();
+        // 3 条全输出（不去重）。
+        assert_eq!(collected.len(), 3);
+        // Ord 升序：seq=3 在前（大 seq 排前），seq=2 中，seq=1 后。
+        let seqs: Vec<u64> = collected
+            .iter()
+            .map(|(k, _)| crate::internal_key::InternalKey::decode(k).unwrap().seq)
+            .collect();
+        assert_eq!(seqs, vec![3, 2, 1]);
+        // Delete 标记的 entry 也在（value 空）。
+        assert_eq!(collected[1].1, b"");
     }
 }

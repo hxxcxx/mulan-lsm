@@ -4,7 +4,7 @@
 //! 每次 flush/compaction append 一条 edit，崩溃恢复时从头回放累积成当前 Version。
 //!
 //! 编码格式：每个字段前缀 1 字节 tag（值忠于 LevelDB），后跟 varint / length-prefixed 数据。
-//! 缺省字段（`None` 或空 `Vec`）不写出，解码时保持缺省。未知 tag 视为损坏——M4 不做向前兼容预留。
+//! 缺省字段（`None` 或空 `Vec`）不写出，解码时保持缺省。未知 tag 视为损坏（不做向前兼容预留）。
 
 use crate::error::{MulanError, Result};
 use crate::file_meta::{
@@ -296,7 +296,7 @@ pub struct ManifestRecovery {
 
 /// 从 CURRENT 指向的 manifest 回放所有 VersionEdit。
 ///
-/// 复用 `WalReader`：遇到坏 record 自动停止（M2 已实现），故崩溃时末尾残片被丢弃，
+/// 复用 `WalReader`：遇到坏 record 自动停止，故崩溃时末尾残片被丢弃，
 /// 恢复到最近一条完整落盘的 edit。
 pub fn recover_manifest(dir: &Path) -> Result<ManifestRecovery> {
     let manifest_number = read_current(dir)?;
@@ -448,8 +448,6 @@ mod tests {
         buf.extend_from_slice(&[0xFF, 0xFE]); // 非 utf-8。
         assert!(VersionEdit::decode(&buf).is_err());
     }
-
-    // ===== Step 4.2: Manifest 文件 + 原子 CURRENT =====
 
     use std::path::PathBuf;
 

@@ -11,6 +11,20 @@ use crate::manifest::{recover_manifest, ManifestWriter, VersionEdit};
 use std::path::Path;
 use std::sync::Arc;
 
+/// 判断文件的 user_key 区间是否与 [range_smallest, range_largest] 重叠。
+/// 比较基于 user_key 字节字典序（internal key 的 user_key 部分）。
+fn user_key_overlap(file: &FileMetaData, range_smallest: &[u8], range_largest: &[u8]) -> bool {
+    // 文件 largest.user_key < range_smallest → 文件在区间左侧，无重叠。
+    if file.largest.user_key.as_slice() < range_smallest {
+        return false;
+    }
+    // 文件 smallest.user_key > range_largest → 文件在区间右侧，无重叠。
+    if file.smallest.user_key.as_slice() > range_largest {
+        return false;
+    }
+    true
+}
+
 /// LevelDB 默认层数：Level 0..=6。L0 文件区间可重叠，L1+ 严格不重叠（由 compaction 保证）。
 pub const NUM_LEVELS: usize = 7;
 
@@ -41,6 +55,21 @@ impl Version {
 
     pub fn num_levels(&self) -> usize {
         NUM_LEVELS
+    }
+
+    /// 返回某层 user_key 区间 [smallest, largest] 内的所有文件。
+    /// 用于 compaction 选下一层重叠文件、祖父层重叠计算。
+    pub fn get_overlaps(
+        &self,
+        level: usize,
+        range_smallest: &[u8],
+        range_largest: &[u8],
+    ) -> Vec<FileMetaData> {
+        self.files[level]
+            .iter()
+            .filter(|f| user_key_overlap(f, range_smallest, range_largest))
+            .cloned()
+            .collect()
     }
 }
 
@@ -78,6 +107,9 @@ pub struct VersionSet {
     pub last_sequence: u64,
     pub manifest_number: FileNumber,
     manifest_writer: ManifestWriter,
+    /// 每层 compaction 轮转起点（user_key 字节）。内存状态，不持久化。
+    /// 下次 compact 该层时从这之后开始选文件，保证 key 空间均匀压缩。
+    compact_pointer: [Vec<u8>; NUM_LEVELS],
 }
 
 impl VersionSet {
@@ -98,6 +130,7 @@ impl VersionSet {
             last_sequence: 0,
             manifest_number,
             manifest_writer: writer,
+            compact_pointer: std::array::from_fn(|_| Vec::new()),
         })
     }
 
@@ -133,6 +166,7 @@ impl VersionSet {
             last_sequence,
             manifest_number: recovery.manifest_number,
             manifest_writer: writer,
+            compact_pointer: std::array::from_fn(|_| Vec::new()),
         })
     }
 
@@ -157,6 +191,16 @@ impl VersionSet {
             self.last_sequence = s;
         }
         Ok(self.current.clone())
+    }
+
+    /// 某层的 compaction 轮转起点（user_key 字节）。
+    pub fn compact_pointer(&self, level: usize) -> &[u8] {
+        &self.compact_pointer[level]
+    }
+
+    /// 更新某层的轮转起点。compaction 完成后调用，记录本次 compact 到的最大 user_key。
+    pub fn set_compact_pointer(&mut self, level: usize, key: Vec<u8>) {
+        self.compact_pointer[level] = key;
     }
 }
 

@@ -646,8 +646,6 @@ mod tests {
         assert_eq!(total_data, vec![0xCDu8; BLOCK_SIZE * 2]);
     }
 
-    // ===== WalReader 测试 =====
-
     fn write_records(path: &std::path::Path, records: &[Vec<u8>]) {
         let mut w = WalWriter::create(path).unwrap();
         for r in records {
