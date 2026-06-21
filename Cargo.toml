@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 thiserror = "1"
 rand = "0.9"
+crc = "3"
 
 [lib]
 name = "mulan_lsm"

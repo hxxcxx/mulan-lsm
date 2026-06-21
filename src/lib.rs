@@ -4,6 +4,7 @@ pub mod error;
 pub mod internal_key;
 pub mod memtable;
 pub mod skiplist;
+pub mod wal;
 
 pub use error::{MulanError, Result};
 
