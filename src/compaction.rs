@@ -243,6 +243,9 @@ pub fn do_compaction(
     let mut current_largest: Option<InternalKey> = None;
     let mut current_grandparent_overlap: u64 = 0;
     let mut current_file_number: Option<FileNumber> = None;
+    // 祖父文件游标：已累加过重叠到第几个祖父文件。grandparents 按 smallest 有序，
+    // user_key 全局单调推进，故游标只前进不回退——保证每个祖父文件至多计入一次重叠。
+    let mut grandparent_idx: usize = 0;
 
     while let Some((ik_bytes, value)) = merger.next() {
         let vtype = vtype_of_internal_key(&ik_bytes);
@@ -297,13 +300,24 @@ pub fn do_compaction(
             current_grandparent_overlap = 0;
         }
 
-        // 累积祖父层重叠：当 user_key 进入新祖父文件区间时累加其大小。
-        for gp in &compaction.grandparents {
-            if user_key >= gp.smallest.user_key.as_slice()
-                && user_key <= gp.largest.user_key.as_slice()
-            {
-                current_grandparent_overlap += gp.file_size;
+        // 累积祖父层重叠：用单调游标推进，每个祖父文件至多计入一次。
+        // grandparents 按 smallest 有序、区间不重叠（L2+ 保证），user_key 全局单调推进，
+        // 故游标只前进。先跳过完全在 user_key 左侧的祖父文件（其重叠已计入或区间在左侧无关），
+        // 再把游标处覆盖 user_key 的祖父文件计入（每个只加一次 file_size）。
+        while grandparent_idx < compaction.grandparents.len() {
+            let gp = &compaction.grandparents[grandparent_idx];
+            if user_key > gp.largest.user_key.as_slice() {
+                // 该祖父文件完全在 user_key 左侧，游标前进。
+                grandparent_idx += 1;
+                continue;
             }
+            if user_key < gp.smallest.user_key.as_slice() {
+                // 该祖父文件完全在 user_key 右侧，后续都不重叠，停止。
+                break;
+            }
+            // user_key 落在该祖父文件 [smallest, largest] 区间内：计入一次。
+            current_grandparent_overlap += gp.file_size;
+            grandparent_idx += 1;
         }
 
         continue_with_entry(
