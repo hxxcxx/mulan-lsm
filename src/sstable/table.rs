@@ -13,7 +13,11 @@
 //! key 存的是 InternalKey 的 encode 字节（user_key + seq 小端 + type），
 //! Block 的 get/lower_bound 用比较器闭包（按 InternalKey Ord 比较），不依赖字节字典序。
 
+use crate::bloom::BloomFilter;
 use crate::error::{MulanError, Result};
+use crate::internal_key::{
+    internal_key_cmp, lookup_key, user_key_of_internal_key, vtype_of_internal_key, ValueType,
+};
 use crate::sstable::block::{Block, BlockBuilder};
 use crate::varint::{decode_varint64, encode_varint64};
 use std::io::Write;
@@ -176,7 +180,7 @@ impl TableBuilder {
         // metaindex block 是一条 Block entry：(key="filter.mulan.BloomFilter", value=filter_handle)。
         // 该间接层支持未来扩展多种 meta 数据，而无需改动 footer 结构。
         let bloom_keys: Vec<&[u8]> = self.user_keys.iter().map(|v| v.as_slice()).collect();
-        let bloom = crate::bloom::BloomFilter::from_keys(&bloom_keys, self.bits_per_key);
+        let bloom = BloomFilter::from_keys(&bloom_keys, self.bits_per_key);
         let filter_handle = self.write_raw(&bloom.finish())?;
         let mut metaindex_builder = BlockBuilder::new();
         let mut meta_value = Vec::new();
@@ -217,7 +221,7 @@ pub struct TableReader {
     data: Vec<u8>,
     index_handle: BlockHandle,
     /// 布隆过滤器，读 data block 前先过滤。
-    bloom: Option<crate::bloom::BloomFilter>,
+    bloom: Option<BloomFilter>,
 }
 
 impl TableReader {
@@ -245,7 +249,7 @@ impl TableReader {
         let (index_handle, _n2) = BlockHandle::decode(&footer[n1..])?;
         // 解析 metaindex block，找到 filter 条目 → 读 filter block 解析布隆。
         // 无 metaindex 或无 filter 条目时 bloom=None，查询降级（全扫 data block 不走布隆）。
-        let bloom = (|| -> Option<crate::bloom::BloomFilter> {
+        let bloom = (|| -> Option<BloomFilter> {
             let meta_start = metaindex_handle.offset as usize;
             let meta_end = meta_start + metaindex_handle.size as usize;
             let meta_block = Block::new(data.get(meta_start..meta_end)?).ok()?;
@@ -254,7 +258,7 @@ impl TableReader {
             let fb_start = filter_handle.offset as usize;
             let fb_end = fb_start + filter_handle.size as usize;
             let bloom_bytes = data.get(fb_start..fb_end)?;
-            crate::bloom::BloomFilter::from_bytes(bloom_bytes)
+            BloomFilter::from_bytes(bloom_bytes)
         })();
         Ok(TableReader {
             data,
@@ -265,10 +269,7 @@ impl TableReader {
 
     /// 按 user_key 查找最新版本的 (vtype, value)。命中时返回两者；未命中返回 None。
     /// 流程：布隆过滤 → 哨兵 internal key → index 定位 data block → block 内 lower_bound → 校验 user_key。
-    pub fn get_entry(&self, user_key: &[u8]) -> Option<(crate::internal_key::ValueType, &[u8])> {
-        use crate::internal_key::{
-            internal_key_cmp, lookup_key, user_key_of_internal_key, vtype_of_internal_key,
-        };
+    pub fn get_entry(&self, user_key: &[u8]) -> Option<(ValueType, &[u8])> {
         // 布隆过滤：user_key 肯定不在则直接返回 None，省掉读 data block。
         if let Some(bloom) = &self.bloom {
             if !bloom.may_contain(user_key) {
@@ -297,11 +298,9 @@ impl TableReader {
 
     /// 按 user_key 查找最新版本。删除标记视为不存在（返回 None）。
     pub fn get(&self, user_key: &[u8]) -> Option<&[u8]> {
-        let (vtype, value) = self.get_entry(user_key)?;
-        if vtype == crate::internal_key::ValueType::Delete {
-            None
-        } else {
-            Some(value)
+        match self.get_entry(user_key)? {
+            (ValueType::Put, value) => Some(value),
+            (ValueType::Delete, _) => None,
         }
     }
 
@@ -407,7 +406,9 @@ impl<'a> Iterator for TableIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::internal_key::{InternalKey, ValueType};
+    use crate::internal_key::{
+        internal_key_cmp, InternalKey, ValueType,
+    };
     use std::path::PathBuf;
 
     static DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -741,7 +742,7 @@ mod tests {
         // 严格按 internal_key_cmp 升序。
         for w in collected.windows(2) {
             assert!(
-                crate::internal_key::internal_key_cmp(&w[0].0, &w[1].0)
+                internal_key_cmp(&w[0].0, &w[1].0)
                     != std::cmp::Ordering::Greater,
                 "entries not in ascending order"
             );
@@ -781,7 +782,7 @@ mod tests {
         // Ord 升序：seq=3 在前（大 seq 排前），seq=2 中，seq=1 后。
         let seqs: Vec<u64> = collected
             .iter()
-            .map(|(k, _)| crate::internal_key::InternalKey::decode(k).unwrap().seq)
+            .map(|(k, _)| InternalKey::decode(k).unwrap().seq)
             .collect();
         assert_eq!(seqs, vec![3, 2, 1]);
         // Delete 标记的 entry 也在（value 空）。

@@ -6,6 +6,7 @@
 use crate::error::Result;
 use crate::internal_key::{InternalKey, ValueType, MAX_SEQUENCE};
 use crate::skiplist::SkipList;
+use crate::sstable::TableBuilder;
 
 /// MemTable flush 的结果：写入条目数 + 首/尾 internal key（供 DB 构造 `FileMetaData`）。
 /// 空 MemTable flush 时 smallest/largest 为 None。
@@ -83,7 +84,7 @@ impl MemTable {
     }
 
     /// 把 MemTable 的全部内容刷成一个 SSTable 文件，返回条目数。
-    pub fn flush_to_sstable(&self, path: &std::path::Path) -> crate::error::Result<u64> {
+    pub fn flush_to_sstable(&self, path: &std::path::Path) -> Result<u64> {
         Ok(self.flush_to_sstable_with_bounds(path)?.num_entries)
     }
 
@@ -92,9 +93,9 @@ impl MemTable {
     pub fn flush_to_sstable_with_bounds(
         &self,
         path: &std::path::Path,
-    ) -> crate::error::Result<FlushResult> {
+    ) -> Result<FlushResult> {
         let file = std::fs::File::create(path)?;
-        let mut builder = crate::sstable::TableBuilder::new(file);
+        let mut builder = TableBuilder::new(file);
         let mut smallest: Option<InternalKey> = None;
         let mut largest: Option<InternalKey> = None;
         for (ik, value) in self.skiplist.iter() {

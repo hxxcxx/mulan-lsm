@@ -14,6 +14,7 @@
 //! 每个 entry：`shared(varint) | non_shared(varint) | value_len(varint) | key_delta | value`
 //! `shared` 是与前一条 key 共享的前缀长度，`non_shared` 是本条独有的 key 后缀长度。
 
+use crate::error::{MulanError, Result};
 use crate::varint::{decode_varint32, encode_varint32};
 
 /// 每 RESTART_INTERVAL 条 entry 设一个 restart point（不压缩，存完整 key）。
@@ -120,8 +121,7 @@ pub struct Block<'a> {
 
 impl<'a> Block<'a> {
     /// 从字节切片构造。解析末尾的 num_restarts 和 restarts 数组。
-    pub fn new(data: &'a [u8]) -> crate::error::Result<Self> {
-        use crate::error::MulanError;
+    pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.len() < 4 {
             return Err(MulanError::Corrupted(
                 "block too short for num_restarts".into(),
@@ -150,7 +150,7 @@ impl<'a> Block<'a> {
     }
 
     /// 解析指定偏移处的一条 entry，返回 (key, value, 下一条 entry 的偏移)。
-    fn entry_at(&self, offset: usize) -> crate::error::Result<(Vec<u8>, &'a [u8], usize)> {
+    fn entry_at(&self, offset: usize) -> Result<(Vec<u8>, &'a [u8], usize)> {
         let (shared, n1) = decode_varint32(&self.data[offset..])?;
         let (non_shared, n2) = decode_varint32(&self.data[offset + n1..])?;
         let (value_len, n3) = decode_varint32(&self.data[offset + n1 + n2..])?;

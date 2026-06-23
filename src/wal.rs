@@ -5,6 +5,9 @@
 //!
 //! block 末尾不足 7 字节（放不下一个 record 头）时填 0 跳过（trailer）。
 
+use crate::error::{MulanError, Result};
+use crate::internal_key::ValueType;
+use crate::varint::{decode_varint32, encode_varint32};
 use std::io::Write;
 
 /// block 固定大小 32KB。损坏时跳到下一个 block 边界，把损坏限制在单 block 内。
@@ -72,11 +75,11 @@ pub fn encode_full(buf: &mut Vec<u8>, data: &[u8]) {
 
 /// 解析 7 字节头。返回头和 data 在 buf 中的起始偏移（HEADER_SIZE 处）。
 /// 头部字段非法（type 未知）时返回错误。
-pub fn decode_header(buf: &[u8; HEADER_SIZE]) -> crate::error::Result<RecordHeader> {
+pub fn decode_header(buf: &[u8; HEADER_SIZE]) -> Result<RecordHeader> {
     let checksum = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let length = u16::from_le_bytes([buf[4], buf[5]]);
     let rtype = RecordType::from_u8(buf[6]).ok_or_else(|| {
-        crate::error::MulanError::Corrupted(format!("unknown record type: {}", buf[6]))
+        MulanError::Corrupted(format!("unknown record type: {}", buf[6]))
     })?;
     Ok(RecordHeader {
         checksum,
@@ -125,7 +128,7 @@ impl WalWriter {
     /// 以追加模式打开（不存在则创建）。从文件尾继续写。
     /// block_offset 取 文件大小 % BLOCK_SIZE；若文件不是整数个 block，
     /// 视为从某个 block 中间继续，由分片逻辑自然处理。
-    pub fn create(path: &std::path::Path) -> crate::error::Result<Self> {
+    pub fn create(path: &std::path::Path) -> Result<Self> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -138,7 +141,7 @@ impl WalWriter {
     }
 
     /// 追加一条记录。任意大小都会被正确分片。
-    pub fn add_record(&mut self, data: &[u8]) -> crate::error::Result<()> {
+    pub fn add_record(&mut self, data: &[u8]) -> Result<()> {
         let mut remaining = data;
         let mut first = true;
         loop {
@@ -178,13 +181,13 @@ impl WalWriter {
     }
 
     /// 把缓冲的数据刷到磁盘。默认 add_record 不自动 fsync，由上层按需调用。
-    pub fn sync(&mut self) -> crate::error::Result<()> {
+    pub fn sync(&mut self) -> Result<()> {
         self.file.sync_all()?;
         Ok(())
     }
 
     /// 关闭前刷盘。
-    pub fn flush(&mut self) -> crate::error::Result<()> {
+    pub fn flush(&mut self) -> Result<()> {
         self.file.flush()?;
         Ok(())
     }
@@ -210,14 +213,14 @@ pub struct WalReader {
 
 impl WalReader {
     /// 把整个文件读进内存后扫描。WAL 通常不大，简化实现。
-    pub fn open(path: &std::path::Path) -> crate::error::Result<Self> {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
         let bytes = std::fs::read(path)?;
         Ok(WalReader { bytes })
     }
 
     /// 扫描所有 block，按状态机拼装 record，返回完整记录的数据列表。
     /// 遇到 crc 失败的片则停止，丢弃正在拼装的残缺记录。
-    pub fn read_records(&self) -> crate::error::Result<Vec<Vec<u8>>> {
+    pub fn read_records(&self) -> Result<Vec<Vec<u8>>> {
         let mut records: Vec<Vec<u8>> = Vec::new();
         let mut fragment: Option<Vec<u8>> = None; // 正在拼装的记录缓存
         let mut pos = 0;
@@ -301,7 +304,7 @@ impl WalReader {
 /// 解析后的 WAL entry：一条用户写操作（put 或 delete）。
 #[derive(Debug, PartialEq, Eq)]
 pub struct WalEntry {
-    pub vtype: crate::internal_key::ValueType,
+    pub vtype: ValueType,
     pub seq: u64,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
@@ -313,7 +316,7 @@ pub struct WalEntry {
 /// seq 直接落地（不取反），因为 WAL 不参与排序，只是顺序回放。
 /// Delete 的 value 编码为空（val_len=0）。
 pub fn encode_entry(
-    vtype: crate::internal_key::ValueType,
+    vtype: ValueType,
     seq: u64,
     key: &[u8],
     value: &[u8],
@@ -321,17 +324,15 @@ pub fn encode_entry(
     let mut buf = Vec::with_capacity(9 + key.len() + value.len());
     buf.push(vtype as u8);
     buf.extend_from_slice(&seq.to_le_bytes());
-    crate::varint::encode_varint32(&mut buf, key.len() as u32);
+    encode_varint32(&mut buf, key.len() as u32);
     buf.extend_from_slice(key);
-    crate::varint::encode_varint32(&mut buf, value.len() as u32);
+    encode_varint32(&mut buf, value.len() as u32);
     buf.extend_from_slice(value);
     buf
 }
 
 /// 解码一条 entry。返回拥有的 WalEntry。
-pub fn decode_entry(data: &[u8]) -> crate::error::Result<WalEntry> {
-    use crate::error::MulanError;
-    use crate::internal_key::ValueType;
+pub fn decode_entry(data: &[u8]) -> Result<WalEntry> {
     if data.len() < 9 {
         return Err(MulanError::Corrupted(format!(
             "entry too short: {} bytes",
@@ -341,13 +342,13 @@ pub fn decode_entry(data: &[u8]) -> crate::error::Result<WalEntry> {
     let vtype = ValueType::from_u8(data[0])
         .ok_or_else(|| MulanError::Corrupted(format!("unknown value type: {}", data[0])))?;
     let seq = u64::from_le_bytes(data[1..9].try_into().unwrap());
-    let (key_len, consumed_kl) = crate::varint::decode_varint32(&data[9..])?;
+    let (key_len, consumed_kl) = decode_varint32(&data[9..])?;
     let key_end = 9 + consumed_kl + key_len as usize;
     if key_end > data.len() {
         return Err(MulanError::Corrupted("entry key out of bounds".into()));
     }
     let key = data[9 + consumed_kl..key_end].to_vec();
-    let (val_len, consumed_vl) = crate::varint::decode_varint32(&data[key_end..])?;
+    let (val_len, consumed_vl) = decode_varint32(&data[key_end..])?;
     let val_start = key_end + consumed_vl;
     let val_end = val_start + val_len as usize;
     if val_end > data.len() {
