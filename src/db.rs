@@ -374,9 +374,10 @@ fn run_one_compaction(inner: &mut std::sync::MutexGuard<'_, DbInner>) -> Result<
     let level = compaction.level;
     let version = inner.version_set.current();
     let dir = inner.dir.clone();
+    let oldest = inner.version_set.oldest_snapshot_seq();
     let start = inner.id_gen.next_number();
     let mut id_gen = IdGenerator::new(start);
-    let output = do_compaction(&dir, &compaction, &version, &mut id_gen)?;
+    let output = do_compaction(&dir, &compaction, &version, &mut id_gen, oldest)?;
     inner.id_gen.bump_to(id_gen.next_number());
     let mut edit = VersionEdit::new();
     for f in &output.new_files {

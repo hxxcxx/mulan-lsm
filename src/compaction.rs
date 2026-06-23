@@ -1,4 +1,4 @@
-﻿//! Compaction：后台归并的触发、选文件、执行。
+//! Compaction：后台归并的触发、选文件、执行。
 
 use crate::error::Result;
 use crate::file_meta::{sst_path, FileMetaData, FileNumber, IdGenerator};
@@ -225,6 +225,7 @@ pub fn do_compaction(
     compaction: &Compaction,
     version: &Version,
     id_gen: &mut IdGenerator,
+    oldest_snapshot_seq: u64,
 ) -> Result<CompactionOutput> {
     // 1. 为每个输入文件开 TableIter，直接作为 LsmIterator 喂给归并（惰性，不全量 collect）。
     let mut iters: Vec<Box<dyn LsmIterator>> = Vec::new();
@@ -246,14 +247,30 @@ pub fn do_compaction(
     // 祖父文件游标：已累加过重叠到第几个祖父文件。grandparents 按 smallest 有序，
     // user_key 全局单调推进，故游标只前进不回退——保证每个祖父文件至多计入一次重叠。
     let mut grandparent_idx: usize = 0;
+    // 上一条已处理 entry 的 user_key + seq，用于版本丢弃判定（见 drop_entry）。
+    let mut last_user_key: Option<Vec<u8>> = None;
+    let mut last_seq: u64 = 0;
 
     while let Some((ik_bytes, value)) = merger.next() {
         let vtype = vtype_of_internal_key(&ik_bytes);
         let user_key = user_key_of_internal_key(&ik_bytes);
         let ik = InternalKey::decode(&ik_bytes)?;
+        let seq = ik.seq;
 
-        // 删除标记丢弃判定：最新版本是 Delete 且是基底层 → 不写入。
-        if vtype == ValueType::Delete && compaction.is_base_level_for_user_key(version, user_key) {
+        // 版本丢弃判定（LevelDB 语义）：
+        // - 与上一条同 user_key 且上一条 seq ≤ oldest_snapshot_seq → 当前条（更旧）可丢，
+        //   因为上一条是"快照可见的更新版本"，当前条对任何快照都无意义。
+        // - 新 user_key 的最新版本：若 Delete 且 is_base_level 且 seq ≤ oldest_snapshot_seq → 可丢，
+        //   否则保留（含 Delete——若 seq > oldest，快照之后可能有更新写入，删了会让旧版本复活）。
+        let is_same_key_as_last = last_user_key.as_deref() == Some(user_key);
+        let last_visible_to_snapshot = last_seq <= oldest_snapshot_seq;
+        let delete_droppable = vtype == ValueType::Delete
+            && seq <= oldest_snapshot_seq
+            && compaction.is_base_level_for_user_key(version, user_key);
+        let drop = (is_same_key_as_last && last_visible_to_snapshot) || delete_droppable;
+        last_user_key = Some(user_key.to_vec());
+        last_seq = seq;
+        if drop {
             continue;
         }
 
@@ -706,7 +723,14 @@ mod tests {
         };
         let mut id_gen = IdGenerator::new(100);
         let version = Version::empty();
-        let output = do_compaction(&dir, &compaction, &version, &mut id_gen).unwrap();
+        let output = do_compaction(
+            &dir,
+            &compaction,
+            &version,
+            &mut id_gen,
+            crate::internal_key::MAX_SEQUENCE,
+        )
+        .unwrap();
         assert_eq!(output.new_files.len(), 1);
         assert_eq!(output.deleted_files.len(), 2);
 
@@ -737,7 +761,14 @@ mod tests {
         };
         let mut id_gen = IdGenerator::new(100);
         let version = Version::empty();
-        let output = do_compaction(&dir, &compaction, &version, &mut id_gen).unwrap();
+        let output = do_compaction(
+            &dir,
+            &compaction,
+            &version,
+            &mut id_gen,
+            crate::internal_key::MAX_SEQUENCE,
+        )
+        .unwrap();
         // 100 * 100KB = 10MB，应切出多个 ~2MB 文件。
         assert!(
             output.new_files.len() > 1,
@@ -782,7 +813,14 @@ mod tests {
         };
         let mut id_gen = IdGenerator::new(100);
         let version = Version::empty();
-        let output = do_compaction(&dir, &compaction, &version, &mut id_gen).unwrap();
+        let output = do_compaction(
+            &dir,
+            &compaction,
+            &version,
+            &mut id_gen,
+            crate::internal_key::MAX_SEQUENCE,
+        )
+        .unwrap();
         // 修复正确：每条 entry 后都因 overlap>20MB 切分，应产生多个文件（>1）。
         // 6 条 key → 至少 2 个文件（第 1 个文件写 1 条后第 2 条触发切分，依此类推）。
         assert!(
@@ -822,7 +860,14 @@ mod tests {
         };
         let mut id_gen = IdGenerator::new(100);
         let version = Version::empty();
-        let output = do_compaction(&dir, &compaction, &version, &mut id_gen).unwrap();
+        let output = do_compaction(
+            &dir,
+            &compaction,
+            &version,
+            &mut id_gen,
+            crate::internal_key::MAX_SEQUENCE,
+        )
+        .unwrap();
         // 用迭代器数 entry：应该只有 1 条（最新 v3）。
         let reader = TableReader::open(&crate::file_meta::sst_path(
             &dir,
@@ -858,7 +903,14 @@ mod tests {
         };
         let mut id_gen = IdGenerator::new(100);
         let version = Version::empty(); // 无更高层 → is_base=true
-        let output = do_compaction(&dir, &compaction, &version, &mut id_gen).unwrap();
+        let output = do_compaction(
+            &dir,
+            &compaction,
+            &version,
+            &mut id_gen,
+            crate::internal_key::MAX_SEQUENCE,
+        )
+        .unwrap();
         // 删除标记被丢弃 + 唯一 entry 是删除标记 → 无 entry 写入 → 输出文件为空或不存在。
         // LevelDB 行为：空输出不产生文件。我们的实现可能产生空文件（finish 空 builder）。
         // 两种都接受：关键是读回时 get(k) 返回 None。
