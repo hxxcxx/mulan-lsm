@@ -298,12 +298,18 @@ pub fn do_compaction(
             current_smallest = Some(ik.clone());
             current_largest = Some(ik.clone());
             current_grandparent_overlap = 0;
+            // 游标归 0：新输出文件从当前 user_key 起，需重新计算它与哪些祖父重叠。
+            // 不能保持游标——否则跨越切分点的大祖父文件（如 [a,z] 同时覆盖前后两个文件）
+            // 只会被前一个文件计入，后一个文件永久漏算，导致后一个文件 overlap 恒为 0、
+            // 永不因祖父重叠切分（漏算）。归 0 后下面的推进循环会重新计入覆盖新起点的祖父。
+            // 每个输出文件独立计算自己与祖父的重叠：同一祖父若覆盖多个输出文件，会被各计一次
+            // （这是对的——每个输出文件确实与该祖父重叠）。区别于原 bug（同一文件内重复计入）。
+            grandparent_idx = 0;
         }
 
-        // 累积祖父层重叠：用单调游标推进，每个祖父文件至多计入一次。
-        // grandparents 按 smallest 有序、区间不重叠（L2+ 保证），user_key 全局单调推进，
-        // 故游标只前进。先跳过完全在 user_key 左侧的祖父文件（其重叠已计入或区间在左侧无关），
-        // 再把游标处覆盖 user_key 的祖父文件计入（每个只加一次 file_size）。
+        // 累积祖父层重叠：推进游标，跳过完全在 user_key 左侧的祖父，计入覆盖 user_key 的。
+        // grandparents 按 smallest 有序、区间不重叠（L2+ 保证）。游标在切分时归 0，
+        // 故此循环每条 entry 从当前 gp_idx 扫到第一个未覆盖 user_key 的祖父为止。
         while grandparent_idx < compaction.grandparents.len() {
             let gp = &compaction.grandparents[grandparent_idx];
             if user_key > gp.largest.user_key.as_slice() {
@@ -749,8 +755,55 @@ mod tests {
     }
 
     #[test]
+    fn grandparent_overlap_recounted_after_split() {
+        // 验证切分后新输出文件重新计算祖父重叠（游标归 0 修复）。
+        // 构造一个大祖父文件 [a,z]，file_size=30MB > MAX_GRANDPARENT_OVERLAP_BYTES(20MB)，
+        // 它覆盖全部输入区间。输入 6 个 key（a..f），每条 entry 都落入该祖父区间。
+        // 修复正确时：第 1 条计入祖父 → overlap=30MB > 20MB → 切分；新文件游标归 0，
+        // 下一条又计入 → 又切分……故应产生多个输出文件。
+        // 若游标不归 0（漏算 bug）：第 1 个文件切分后，后续文件 overlap 恒 0，
+        // 全挤进 1 个文件（靠 size 才切，但这里数据小不会到 size）。
+        let dir = tmp_compaction_dir("gp_split");
+        let kvs: Vec<(Vec<u8>, Vec<u8>)> = (0..6u32)
+            .map(|i| (format!("k{i}").into_bytes(), b"v".to_vec()))
+            .collect();
+        let f1 = build_sst(&dir, FileNumber(1), 0, &kvs);
+        // 祖父文件 [a, z]，file_size 虚构为 30MB（不需要真实文件存在，do_compaction 只读元数据）。
+        let grandparent = FileMetaData::new(
+            FileNumber(99),
+            30 * 1024 * 1024,
+            InternalKey::new(b"a".to_vec(), 0, ValueType::Put),
+            InternalKey::new(b"z".to_vec(), 0, ValueType::Put),
+        );
+        let compaction = Compaction {
+            level: 0,
+            inputs: [vec![f1], vec![]],
+            grandparents: vec![grandparent],
+        };
+        let mut id_gen = IdGenerator::new(100);
+        let version = Version::empty();
+        let output = do_compaction(&dir, &compaction, &version, &mut id_gen).unwrap();
+        // 修复正确：每条 entry 后都因 overlap>20MB 切分，应产生多个文件（>1）。
+        // 6 条 key → 至少 2 个文件（第 1 个文件写 1 条后第 2 条触发切分，依此类推）。
+        assert!(
+            output.new_files.len() > 1,
+            "切分后应重新计算祖父重叠产生多个文件，实际 {} 个（可能漏算：游标未归 0）",
+            output.new_files.len()
+        );
+        // 验证全部 key 都写入了（分布在多个文件里）。
+        let mut all_keys: Vec<Vec<u8>> = Vec::new();
+        for f in &output.new_files {
+            let reader = TableReader::open(&crate::file_meta::sst_path(&dir, f.number)).unwrap();
+            for (ik_bytes, _) in reader.into_table_iter().unwrap() {
+                all_keys.push(user_key_of_internal_key(&ik_bytes).to_vec());
+            }
+        }
+        all_keys.sort();
+        assert_eq!(all_keys.len(), 6, "全部 6 条 key 都应写入");
+    }
+
+    #[test]
     fn compaction_drops_old_versions() {
-        // 同 user_key 多版本，归并后只剩最新。
         let dir = tmp_compaction_dir("dropold");
         let f1 = build_sst(
             &dir,
