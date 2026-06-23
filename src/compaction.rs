@@ -5,7 +5,7 @@ use crate::file_meta::{sst_path, FileMetaData, FileNumber, IdGenerator};
 use crate::internal_key::{
     user_key_of_internal_key, vtype_of_internal_key, InternalKey, ValueType,
 };
-use crate::iterator::{LsmIterator, MergingIterator, VecIterator};
+use crate::iterator::{LsmIterator, MergingIterator};
 use crate::sstable::table::{TableBuilder, TableReader};
 use crate::version::{Version, VersionSet, NUM_LEVELS};
 
@@ -226,13 +226,12 @@ pub fn do_compaction(
     version: &Version,
     id_gen: &mut IdGenerator,
 ) -> Result<CompactionOutput> {
-    // 1. 为每个输入文件开 TableIter，collect 成 Vec 后包成 VecIterator（避开生命周期）。
+    // 1. 为每个输入文件开 TableIter，直接作为 LsmIterator 喂给归并（惰性，不全量 collect）。
     let mut iters: Vec<Box<dyn LsmIterator>> = Vec::new();
     for level_files in &compaction.inputs {
         for f in level_files {
             let reader = TableReader::open(&sst_path(dir, f.number))?;
-            let items: Vec<(Vec<u8>, Vec<u8>)> = reader.iter().collect();
-            iters.push(Box::new(VecIterator::new(items)));
+            iters.push(Box::new(reader.into_table_iter()?));
         }
     }
     let mut merger = MergingIterator::new(iters);
@@ -763,7 +762,7 @@ mod tests {
             output.new_files[0].number,
         ))
         .unwrap();
-        let entries: Vec<_> = reader.iter().collect();
+        let entries: Vec<_> = reader.into_table_iter().unwrap().collect();
         assert_eq!(entries.len(), 1, "old versions should be dropped");
         assert_eq!(entries[0].1, b"v3");
     }

@@ -305,9 +305,11 @@ impl TableReader {
     }
 
     /// 顺序遍历全表所有 (internal_key, value)，按 `internal_key_cmp` 升序。
-    /// 供 compaction 归并用——全量扫描，不走二分。
-    pub fn iter(&self) -> TableIter<'_> {
-        TableIter::new(self)
+    /// 消费 self（move 文件字节进 TableIter），返回 `'static` 的惰性迭代器。
+    /// 供 compaction 归并用——可直接 `Box::new(reader.into_table_iter()?)` 喂给 `MergingIterator`，
+    /// 避免先 collect 成 Vec 的全量加载。
+    pub fn into_table_iter(self) -> Result<TableIter> {
+        TableIter::new(self.data, self.index_handle)
     }
 
     /// 取一个 block 的字节切片。
@@ -324,10 +326,47 @@ impl TableReader {
         }
         Ok(&self.data[start..end])
     }
+}
 
-    /// 读 index block，解析出所有 data block 的 handle（按文件顺序）。
-    fn data_handles(&self) -> Result<Vec<BlockHandle>> {
-        let index_bytes = self.block_bytes(&self.index_handle)?;
+/// SSTable 顺序迭代器：流式输出全表 (internal_key_bytes, value_bytes)。
+///
+/// 自持文件全部字节（`'static`），可直接 `Box` 成 `dyn LsmIterator` 喂给 `MergingIterator`。
+/// 惰性加载：构造时只解析 index 得到 data block handle 列表，**不解析任何 data block**；
+/// `next` 推进时按需解析当前 block 的全部 entry 到 owned `current`，用完再切下一个。
+/// 故峰值内存 ≈ 一个 data block（~4KB）而非整表——compaction 读 N 个文件时，
+/// 峰值 ≈ N 个 block，而非 N 个整表（避免几十/几百 MB 的全量加载）。
+pub struct TableIter {
+    data: Vec<u8>,
+    handles: Vec<BlockHandle>,
+    handle_idx: usize,
+    /// 当前 data block 的所有 entry（已解析为 owned）。
+    current: Vec<(Vec<u8>, Vec<u8>)>,
+    current_pos: usize,
+}
+
+impl TableIter {
+    /// 从文件全部字节 + index handle 构造。解析 index 得到 data block handle 列表，
+    /// 但不解析任何 data block（惰性）。
+    fn new(data: Vec<u8>, index_handle: BlockHandle) -> Result<Self> {
+        let handles = Self::parse_data_handles(&data, &index_handle).unwrap_or_default();
+        Ok(TableIter {
+            data,
+            handles,
+            handle_idx: 0,
+            current: Vec::new(),
+            current_pos: 0,
+        })
+    }
+
+    fn parse_data_handles(data: &[u8], index_handle: &BlockHandle) -> Result<Vec<BlockHandle>> {
+        let start = index_handle.offset as usize;
+        let end = start + index_handle.size as usize;
+        let index_bytes = data.get(start..end).ok_or_else(|| {
+            MulanError::Corrupted(format!(
+                "index handle out of bounds: offset={} size={}",
+                index_handle.offset, index_handle.size
+            ))
+        })?;
         let index_block = Block::new(index_bytes)?;
         let mut handles = Vec::new();
         for (_key, handle_bytes) in index_block.iter() {
@@ -336,34 +375,16 @@ impl TableReader {
         }
         Ok(handles)
     }
-}
 
-/// SSTable 顺序迭代器：流式输出全表 (internal_key_bytes, value_bytes)。
-///
-/// 状态机：从 index 解析出所有 data block 的 handle，逐个 block 解析其全部 entry 到
-/// owned `Vec`，再顺序返回。block 仅 ~4KB，一次性解析开销可忽略，且彻底规避 `BlockIter`
-/// 借用临时 `Block` 的生命周期冲突。Block 内已按 `internal_key_cmp` 有序，index 按 data
-/// block 顺序，故全表输出严格按 `internal_key_cmp` 升序。
-pub struct TableIter<'a> {
-    reader: &'a TableReader,
-    handles: Vec<BlockHandle>,
-    handle_idx: usize,
-    /// 当前 data block 的所有 entry（已解析为 owned）。
-    current: Vec<(Vec<u8>, Vec<u8>)>,
-    current_pos: usize,
-}
+    /// 已加载（解析）过的 data block 数。供测试观察惰性：构造时应为 0，
+    /// 每次 next 跨越 block 边界时 +1。
+    pub fn blocks_loaded(&self) -> usize {
+        self.handle_idx
+    }
 
-impl<'a> TableIter<'a> {
-    fn new(reader: &'a TableReader) -> Self {
-        // data_handles 失败时留空，next 会直接返回 None（损坏文件不产出条目）。
-        let handles = reader.data_handles().unwrap_or_default();
-        TableIter {
-            reader,
-            handles,
-            handle_idx: 0,
-            current: Vec::new(),
-            current_pos: 0,
-        }
+    /// data block 总数（来自 index）。供测试判断"是否还有未加载的 block"。
+    pub fn blocks_loaded_capacity(&self) -> usize {
+        self.handles.len()
     }
 
     /// 解析下一个 data block 的全部 entry 到 `current`。返回 false 表示已无 block。
@@ -371,7 +392,9 @@ impl<'a> TableIter<'a> {
         while self.handle_idx < self.handles.len() {
             let handle = self.handles[self.handle_idx];
             self.handle_idx += 1;
-            if let Ok(bytes) = self.reader.block_bytes(&handle) {
+            let start = handle.offset as usize;
+            let end = start + handle.size as usize;
+            if let Some(bytes) = self.data.get(start..end) {
                 if let Ok(block) = Block::new(bytes) {
                     self.current = block.iter().map(|(k, v)| (k, v.to_vec())).collect();
                     self.current_pos = 0;
@@ -383,12 +406,9 @@ impl<'a> TableIter<'a> {
         self.current.clear();
         false
     }
-}
 
-impl<'a> Iterator for TableIter<'a> {
-    type Item = (Vec<u8>, Vec<u8>);
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// 推进到下一条，返回 owned (key, value)。`Iterator::next` 与 `LsmIterator::next` 共用此逻辑。
+    fn next_entry(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         loop {
             if self.current_pos < self.current.len() {
                 let item = self.current[self.current_pos].clone();
@@ -400,6 +420,26 @@ impl<'a> Iterator for TableIter<'a> {
                 return None;
             }
         }
+    }
+}
+
+impl Iterator for TableIter {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_entry()
+    }
+}
+
+impl crate::iterator::LsmIterator for TableIter {
+    fn peek(&self) -> Option<(&[u8], &[u8])> {
+        self.current
+            .get(self.current_pos)
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+    }
+
+    fn next(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.next_entry()
     }
 }
 
@@ -689,7 +729,7 @@ mod tests {
         let file = std::fs::File::create(&path).unwrap();
         TableBuilder::new(file).finish().unwrap();
         let reader = TableReader::open(&path).unwrap();
-        let collected: Vec<_> = reader.iter().collect();
+        let collected: Vec<_> = reader.into_table_iter().unwrap().collect();
         assert!(collected.is_empty());
     }
 
@@ -706,7 +746,7 @@ mod tests {
         builder.finish().unwrap();
 
         let reader = TableReader::open(&path).unwrap();
-        let collected: Vec<(Vec<u8>, Vec<u8>)> = reader.iter().collect();
+        let collected: Vec<(Vec<u8>, Vec<u8>)> = reader.into_table_iter().unwrap().collect();
         assert_eq!(collected.len(), entries.len());
         // 字节与写入一致（internal key 字节 + value）。
         for (i, ((ik, value), (got_key, got_val))) in
@@ -731,7 +771,7 @@ mod tests {
         assert!(std::fs::metadata(&path).unwrap().len() > DATA_BLOCK_TARGET as u64);
 
         let reader = TableReader::open(&path).unwrap();
-        let collected: Vec<_> = reader.iter().collect();
+        let collected: Vec<_> = reader.into_table_iter().unwrap().collect();
         assert_eq!(
             collected.len(),
             entries.len(),
@@ -773,7 +813,7 @@ mod tests {
         builder.finish().unwrap();
 
         let reader = TableReader::open(&path).unwrap();
-        let collected: Vec<_> = reader.iter().collect();
+        let collected: Vec<_> = reader.into_table_iter().unwrap().collect();
         // 3 条全输出（不去重）。
         assert_eq!(collected.len(), 3);
         // Ord 升序：seq=3 在前（大 seq 排前），seq=2 中，seq=1 后。
@@ -784,5 +824,73 @@ mod tests {
         assert_eq!(seqs, vec![3, 2, 1]);
         // Delete 标记的 entry 也在（value 空）。
         assert_eq!(collected[1].1, b"");
+    }
+
+    /// 惰性加载验证：TableIter 构造时不解析任何 data block，next 跨 block 边界时才加载。
+    ///
+    /// 对比改前：`reader.iter().collect::<Vec<_>>()` 会驱动迭代器到耗尽，
+    /// 一次性解析全部 data block，峰值内存 = 整表所有 entry。
+    /// 改后 `into_iter()` 返回惰性 TableIter，按需加载一个 block，
+    /// 峰值内存 ≈ 一个 block（~4KB）。本测试用 blocks_loaded() 观察这个差异。
+    #[test]
+    fn table_iter_is_lazy() {
+        use crate::iterator::LsmIterator;
+        let path = tmp_path("lazy.sst");
+        // 构造一个大 SSTable：5000 条，block target 调小（256B）强制切成多个 data block。
+        let mut entries: Vec<(InternalKey, Vec<u8>)> = (0..5000u32)
+            .map(|i| {
+                (
+                    InternalKey::new((i as u64).to_be_bytes().to_vec(), 1, ValueType::Put),
+                    format!("value-{i}").into_bytes(),
+                )
+            })
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        let file = std::fs::File::create(&path).unwrap();
+        let mut builder = TableBuilder::with_block_target(file, 256);
+        for (ik, value) in &entries {
+            builder.add(&ik.user_key, &ik.encode(), value).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = TableReader::open(&path).unwrap();
+        let mut iter = reader.into_table_iter().unwrap();
+        let total_blocks = iter.blocks_loaded_capacity();
+        assert!(total_blocks > 5, "测试需要多个 block，实际 {total_blocks}");
+
+        // 1. 构造 TableIter 后、未 next 前：blocks_loaded == 0（没解析任何 data block）。
+        assert_eq!(iter.blocks_loaded(), 0, "构造时不该加载任何 data block");
+
+        // 2. 取前 3 条：只加载了第 1 个 block（blocks_loaded == 1）。
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(Iterator::next(&mut iter).unwrap());
+        }
+        assert_eq!(got.len(), 3);
+        assert_eq!(
+            iter.blocks_loaded(),
+            1,
+            "取 3 条只该加载 1 个 block，实际 {}",
+            iter.blocks_loaded()
+        );
+
+        // 3. 提前 drop：剩余 block 从未被加载。blocks_loaded 远小于总数。
+        let loaded_so_far = iter.blocks_loaded();
+        drop(iter);
+        assert!(
+            loaded_so_far < total_blocks,
+            "提前终止时只加载 {loaded_so_far} 个 block，但总共 {total_blocks}——\
+             若全量加载则违背惰性"
+        );
+
+        // 4. 完整遍历应加载全部 block（验证惰性不丢数据）。
+        let reader2 = TableReader::open(&path).unwrap();
+        let mut iter2: Box<dyn LsmIterator> = Box::new(reader2.into_table_iter().unwrap());
+        let mut count = 0;
+        while iter2.next().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 5000, "完整遍历必须吐出全部 5000 条");
     }
 }
