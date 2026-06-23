@@ -3,12 +3,13 @@
 //! 文件布局：
 //! ```text
 //! [data block 0][data block 1]...[data block N-1]
-//! [metaindex block]   ← 第一版为空 block（无 filter），占位
-//! [index block]       ← 每 data block 一条 (最大 key 的 sort_key, handle)
+//! [filter block]      ← 布隆过滤器位数组
+//! [metaindex block]   ← Block 格式，存 (key="filter.mulan.BloomFilter", value=filter_handle)
+//! [index block]       ← 每 data block 一条 (最大 key, handle)
 //! [footer]            ← 固定长度，含 metaindex/index handle + magic
 //! ```
 //!
-//! data block / index block 都用 Block 格式（纯字节 + 前缀压缩）。
+//! data block / index block / metaindex block 都用 Block 格式（纯字节 + 前缀压缩）。
 //! key 存的是 InternalKey 的 encode 字节（user_key + seq 小端 + type），
 //! Block 的 get/lower_bound 用比较器闭包（按 InternalKey Ord 比较），不依赖字节字典序。
 
@@ -71,6 +72,9 @@ pub struct TableBuilder {
     /// 布隆的 bits_per_key。
     bits_per_key: usize,
 }
+
+/// metaindex block 中 filter 条目的 key。
+const FILTER_META_KEY: &[u8] = b"filter.mulan.BloomFilter";
 
 impl TableBuilder {
     pub fn new(file: std::fs::File) -> Self {
@@ -168,11 +172,17 @@ impl TableBuilder {
             }
         }
 
-        // 构建 Bloom Filter 写入 meta block（直接用布隆字节作为 meta block 内容）。
+        // 构建 Bloom Filter 写入 filter block，再写 metaindex block。
+        // metaindex block 是一条 Block entry：(key="filter.mulan.BloomFilter", value=filter_handle)。
+        // 该间接层支持未来扩展多种 meta 数据，而无需改动 footer 结构。
         let bloom_keys: Vec<&[u8]> = self.user_keys.iter().map(|v| v.as_slice()).collect();
         let bloom = crate::bloom::BloomFilter::from_keys(&bloom_keys, self.bits_per_key);
-        let metaindex_bytes = bloom.finish();
-        let metaindex_handle = self.write_raw(&metaindex_bytes)?;
+        let filter_handle = self.write_raw(&bloom.finish())?;
+        let mut metaindex_builder = BlockBuilder::new();
+        let mut meta_value = Vec::new();
+        filter_handle.encode(&mut meta_value);
+        metaindex_builder.add(FILTER_META_KEY, &meta_value);
+        let metaindex_handle = self.write_raw(&metaindex_builder.finish())?;
 
         // 写 index block。
         let index_bytes = std::mem::take(&mut self.index_block).finish();
@@ -233,14 +243,19 @@ impl TableReader {
         // 解析两个 handle（metaindex 在前，index 在后）。
         let (metaindex_handle, n1) = BlockHandle::decode(footer)?;
         let (index_handle, _n2) = BlockHandle::decode(&footer[n1..])?;
-        // 解析布隆（meta block 内容直接是布隆字节）。
-        let bloom_start = metaindex_handle.offset as usize;
-        let bloom_end = bloom_start + metaindex_handle.size as usize;
-        let bloom = if bloom_end <= data.len() {
-            crate::bloom::BloomFilter::from_bytes(&data[bloom_start..bloom_end])
-        } else {
-            None
-        };
+        // 解析 metaindex block，找到 filter 条目 → 读 filter block 解析布隆。
+        // 无 metaindex 或无 filter 条目时 bloom=None，查询降级（全扫 data block 不走布隆）。
+        let bloom = (|| -> Option<crate::bloom::BloomFilter> {
+            let meta_start = metaindex_handle.offset as usize;
+            let meta_end = meta_start + metaindex_handle.size as usize;
+            let meta_block = Block::new(data.get(meta_start..meta_end)?).ok()?;
+            let filter_handle_bytes = meta_block.get(FILTER_META_KEY, &|a, b| a.cmp(b))?;
+            let (filter_handle, _) = BlockHandle::decode(filter_handle_bytes).ok()?;
+            let fb_start = filter_handle.offset as usize;
+            let fb_end = fb_start + filter_handle.size as usize;
+            let bloom_bytes = data.get(fb_start..fb_end)?;
+            crate::bloom::BloomFilter::from_bytes(bloom_bytes)
+        })();
         Ok(TableReader {
             data,
             index_handle,
