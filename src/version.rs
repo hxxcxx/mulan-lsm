@@ -7,6 +7,7 @@
 
 use crate::error::{MulanError, Result};
 use crate::file_meta::{FileMetaData, FileNumber};
+use crate::internal_key::MAX_SEQUENCE;
 use crate::manifest::{recover_manifest, ManifestWriter, VersionEdit};
 use std::path::Path;
 use std::sync::Arc;
@@ -110,6 +111,10 @@ pub struct VersionSet {
     /// 每层 compaction 轮转起点（user_key 字节）。内存状态，不持久化。
     /// 下次 compact 该层时从这之后开始选文件，保证 key 空间均匀压缩。
     compact_pointer: [Vec<u8>; NUM_LEVELS],
+    /// 活跃快照的 seq 列表。compaction 丢弃旧版本时用它判断下限：
+    /// seq > oldest_snapshot_seq 的版本可能被快照引用，不能丢。
+    /// 快照数量通常很少（个位数），用 Vec 的 O(n) 删除换取零 unsafe。
+    snapshots: Vec<u64>,
 }
 
 impl VersionSet {
@@ -131,6 +136,7 @@ impl VersionSet {
             manifest_number,
             manifest_writer: writer,
             compact_pointer: std::array::from_fn(|_| Vec::new()),
+            snapshots: Vec::new(),
         })
     }
 
@@ -167,6 +173,7 @@ impl VersionSet {
             manifest_number: recovery.manifest_number,
             manifest_writer: writer,
             compact_pointer: std::array::from_fn(|_| Vec::new()),
+            snapshots: Vec::new(),
         })
     }
 
@@ -201,6 +208,28 @@ impl VersionSet {
     /// 更新某层的轮转起点。compaction 完成后调用，记录本次 compact 到的最大 user_key。
     pub fn set_compact_pointer(&mut self, level: usize, key: Vec<u8>) {
         self.compact_pointer[level] = key;
+    }
+
+    /// 获取快照：记录当前 last_sequence，作为一致性读的时间点。
+    /// 返回的 seq 后续用于读路径（只看 ≤ 该 seq 的版本）和释放注销。
+    /// 调用方需保证持锁调用（快照注册是 VersionSet 状态变更）。
+    pub fn acquire_snapshot(&mut self) -> u64 {
+        let seq = self.last_sequence;
+        self.snapshots.push(seq);
+        seq
+    }
+
+    /// 释放快照：从活跃列表移除该 seq。调用方需保证持锁。
+    /// 移除后该快照引用的旧版本可能在下次 compaction 中被回收。
+    pub fn release_snapshot(&mut self, seq: u64) {
+        self.snapshots.retain(|&s| s != seq);
+    }
+
+    /// 最老活跃快照的 seq。compaction 丢弃旧版本时的下限：
+    /// seq > 此值的版本可能被快照引用，必须保留。
+    /// 无活跃快照时返回 MAX_SEQUENCE（任何旧版本都可被回收）。
+    pub fn oldest_snapshot_seq(&self) -> u64 {
+        self.snapshots.iter().copied().min().unwrap_or(MAX_SEQUENCE)
     }
 }
 
@@ -372,5 +401,63 @@ mod tests {
         let final_vs = VersionSet::recover(&dir).unwrap();
         assert_eq!(final_vs.current().num_files(0), 1);
         assert_eq!(final_vs.last_sequence, 2);
+    }
+
+    #[test]
+    fn snapshot_acquire_returns_current_sequence() {
+        // 获取快照时，返回的 seq 应等于当时 last_sequence。
+        let dir = tmp_dir("snap-acquire");
+        let mut vs = VersionSet::new_pending(&dir, FileNumber(1)).unwrap();
+        let mut e = VersionEdit::new();
+        e.set_next_file_number(2).set_last_sequence(42);
+        vs.write_new_version(&e).unwrap();
+        let snap_seq = vs.acquire_snapshot();
+        assert_eq!(snap_seq, 42);
+    }
+
+    #[test]
+    fn snapshot_oldest_is_min_when_multiple() {
+        // 多个快照时，oldest = 最小 seq。
+        let dir = tmp_dir("snap-oldest");
+        let mut vs = VersionSet::new_pending(&dir, FileNumber(1)).unwrap();
+        let mut e = VersionEdit::new();
+        e.set_next_file_number(2).set_last_sequence(10);
+        vs.write_new_version(&e).unwrap();
+        let s1 = vs.acquire_snapshot(); // seq=10
+                                        // 推进 last_sequence 到 20，再获取快照。
+        let mut e2 = VersionEdit::new();
+        e2.set_last_sequence(20);
+        vs.write_new_version(&e2).unwrap();
+        let s2 = vs.acquire_snapshot(); // seq=20
+                                        // oldest 应是较小的 10。
+        assert_eq!(vs.oldest_snapshot_seq(), 10);
+        // 释放 s1 后 oldest 变成 20。
+        vs.release_snapshot(s1);
+        assert_eq!(vs.oldest_snapshot_seq(), 20);
+        // 释放 s2 后无活跃快照，返回 MAX_SEQUENCE（任何旧版本可回收）。
+        vs.release_snapshot(s2);
+        assert_eq!(vs.oldest_snapshot_seq(), MAX_SEQUENCE);
+    }
+
+    #[test]
+    fn snapshot_no_active_returns_max() {
+        // 无活跃快照时 oldest = MAX_SEQUENCE。
+        let dir = tmp_dir("snap-none");
+        let vs = VersionSet::new_pending(&dir, FileNumber(1)).unwrap();
+        assert_eq!(vs.oldest_snapshot_seq(), MAX_SEQUENCE);
+    }
+
+    #[test]
+    fn snapshot_release_is_idempotent_safe() {
+        // release 一个不存在的 seq 不应 panic（容错）。
+        let dir = tmp_dir("snap-release");
+        let mut vs = VersionSet::new_pending(&dir, FileNumber(1)).unwrap();
+        let mut e = VersionEdit::new();
+        e.set_next_file_number(2).set_last_sequence(5);
+        vs.write_new_version(&e).unwrap();
+        let s = vs.acquire_snapshot();
+        vs.release_snapshot(s);
+        vs.release_snapshot(s); // 重复 release，不应 panic
+        assert_eq!(vs.oldest_snapshot_seq(), MAX_SEQUENCE);
     }
 }

@@ -56,6 +56,30 @@ pub struct Db {
     bg_thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// 一致性快照句柄。RAII：drop 时自动从 VersionSet 注销。
+///
+/// 快照固定一个 seq，读时只看 ≤ 该 seq 的版本，实现 MVCC 一致性读。
+/// 同时约束 compaction：seq > 快照 seq 的旧版本不会被回收，保证快照可读。
+pub struct SnapshotGuard {
+    seq: u64,
+    inner: Arc<(Mutex<DbInner>, Condvar)>,
+}
+
+impl SnapshotGuard {
+    /// 快照固定的 seq。读路径用此值过滤版本。
+    pub fn sequence(&self) -> u64 {
+        self.seq
+    }
+}
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        let (lock, _) = &*self.inner;
+        let mut inner = lock.lock().unwrap();
+        inner.version_set.release_snapshot(self.seq);
+    }
+}
+
 impl Db {
     pub fn open(dir: &Path, options: Options) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
@@ -242,6 +266,27 @@ impl Db {
 
     pub fn current_version(&self) -> Arc<Version> {
         self.inner.0.lock().unwrap().version_set.current()
+    }
+
+    /// 获取一致性快照：固定当前 last_sequence 作为读时间点。
+    /// 返回的 SnapshotGuard drop 时自动释放。快照存在期间，compaction 不会回收
+    /// seq > 快照 seq 的旧版本，保证快照读到的一致性视图稳定。
+    pub fn new_snapshot(&self) -> SnapshotGuard {
+        let (lock, _) = &*self.inner;
+        let mut inner = lock.lock().unwrap();
+        let seq = inner.version_set.acquire_snapshot();
+        SnapshotGuard {
+            seq,
+            inner: self.inner.clone(),
+        }
+    }
+
+    /// 当前最老活跃快照的 seq（无活跃快照返回 MAX_SEQUENCE）。
+    /// 供测试和诊断观察快照对 compaction 的约束。
+    pub fn oldest_snapshot_seq(&self) -> u64 {
+        let (lock, _) = &*self.inner;
+        let inner = lock.lock().unwrap();
+        inner.version_set.oldest_snapshot_seq()
     }
 
     /// 手动触发一次 compaction（测试用）。返回是否执行了 compaction。
@@ -865,5 +910,59 @@ mod tests {
         let db2 = Db::open(&dir, small_options()).unwrap();
         assert_eq!(db2.get(b"k0").unwrap(), Some(b"v".to_vec()));
         let _ = handle; // 抑制未使用警告。
+    }
+
+    #[test]
+    fn snapshot_acquire_and_release_via_guard() {
+        // SnapshotGuard 是 RAII：drop 时自动从 VersionSet 注销。
+        let dir = tmp_dir("snap-guard");
+        let db = Db::open(&dir, small_options()).unwrap();
+        db.put(b"k1", b"v1").unwrap(); // seq=1
+
+        {
+            let snap = db.new_snapshot();
+            assert_eq!(snap.sequence(), 1, "快照 seq 应等于当时的 last_sequence");
+            assert_eq!(
+                db.oldest_snapshot_seq(),
+                1,
+                "快照存在时 oldest 应为快照 seq"
+            );
+        } // snap 在此 drop
+        assert_eq!(
+            db.oldest_snapshot_seq(),
+            u64::MAX,
+            "快照释放后 oldest 应恢复 MAX"
+        );
+    }
+
+    #[test]
+    fn snapshot_multiple_guards_track_oldest() {
+        // 多个快照时 oldest = 最小 seq；逐个释放后 oldest 跟进。
+        let dir = tmp_dir("snap-multi");
+        let db = Db::open(&dir, small_options()).unwrap();
+        db.put(b"a", b"1").unwrap(); // seq=1
+        let snap1 = db.new_snapshot(); // seq=1
+        db.put(b"b", b"2").unwrap(); // seq=2
+        let snap2 = db.new_snapshot(); // seq=2
+        assert_eq!(db.oldest_snapshot_seq(), 1);
+
+        drop(snap1);
+        assert_eq!(db.oldest_snapshot_seq(), 2);
+
+        drop(snap2);
+        assert_eq!(db.oldest_snapshot_seq(), u64::MAX);
+    }
+
+    #[test]
+    fn snapshot_seq_advances_with_writes() {
+        // 写入推进 last_sequence，新快照的 seq 比旧快照大。
+        let dir = tmp_dir("snap-advance");
+        let db = Db::open(&dir, small_options()).unwrap();
+        db.put(b"a", b"1").unwrap();
+        let s1 = db.new_snapshot();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+        let s2 = db.new_snapshot();
+        assert!(s2.sequence() > s1.sequence(), "新快照 seq 应更大");
     }
 }
