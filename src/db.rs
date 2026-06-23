@@ -317,7 +317,7 @@ fn maybe_schedule_compaction(inner: &mut DbInner) {
 
 /// 执行一次 compaction：pick → 归并 → 提交。返回是否做了 compaction。
 fn run_one_compaction(inner: &mut std::sync::MutexGuard<'_, DbInner>) -> Result<bool> {
-    let compaction = match pick_compaction(&inner.version_set.current(), &inner.version_set) {
+    let compaction = match pick_compaction(&inner.version_set) {
         Some(c) => c,
         None => return Ok(false),
     };

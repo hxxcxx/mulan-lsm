@@ -1,4 +1,4 @@
-//! Compaction：后台归并的触发、选文件、执行。
+﻿//! Compaction：后台归并的触发、选文件、执行。
 
 use crate::error::Result;
 use crate::file_meta::{sst_path, FileMetaData, FileNumber, IdGenerator};
@@ -129,8 +129,9 @@ impl Compaction {
 /// - L0：文件区间重叠，选所有与"compact_pointer 之后"重叠的 L0 文件；
 ///   若 pointer 为空则选全部 L0。然后选 L1 中与之重叠的文件。
 /// - L1+：从 compact_pointer 之后选第一个文件，再选 level+1 中与该文件重叠的文件。
-pub fn pick_compaction(version: &Version, vs: &VersionSet) -> Option<Compaction> {
-    let (level, _score) = compaction_score(version)?;
+pub fn pick_compaction(vs: &VersionSet) -> Option<Compaction> {
+    let version = vs.current();
+    let (level, _score) = compaction_score(&version)?;
     if level >= NUM_LEVELS - 1 {
         // 最后一层不 compact（没有下一层可归并）。
         return None;
@@ -145,7 +146,7 @@ pub fn pick_compaction(version: &Version, vs: &VersionSet) -> Option<Compaction>
     } else {
         // L1+：从 compact_pointer 之后选第一个文件。
         let pointer = vs.compact_pointer(level);
-        let mut picked = None;
+        let mut picked: Option<FileMetaData> = None;
         for f in version.files_at(level) {
             if pointer.is_empty() || f.largest.user_key.as_slice() > pointer {
                 picked = Some(f.clone());
@@ -158,31 +159,36 @@ pub fn pick_compaction(version: &Version, vs: &VersionSet) -> Option<Compaction>
 
     // 选 level+1 中与本层输入区间重叠的文件。
     if !inputs[0].is_empty() {
-        let smallest = inputs[0]
-            .first()
-            .map(|f| f.smallest.user_key.as_slice())
-            .unwrap_or(&[]);
-        let largest = inputs[0]
-            .last()
-            .map(|f| f.largest.user_key.as_slice())
-            .unwrap_or(&[]);
         // 对 L0，inputs[0] 可能多个文件区间不连续，用并集区间 [最小 smallest, 最大 largest]。
-        let mut range_smallest = smallest.to_vec();
-        let mut range_largest = largest.to_vec();
-        for f in &inputs[0] {
-            if f.smallest.user_key.as_slice() < range_smallest.as_slice() {
-                range_smallest = f.smallest.user_key.clone();
-            }
-            if f.largest.user_key.as_slice() > range_largest.as_slice() {
-                range_largest = f.largest.user_key.clone();
-            }
-        }
+        let range_smallest = inputs[0]
+            .iter()
+            .map(|f| f.smallest.user_key.as_slice())
+            .min()
+            .unwrap()
+            .to_vec();
+        let range_largest = inputs[0]
+            .iter()
+            .map(|f| f.largest.user_key.as_slice())
+            .max()
+            .unwrap()
+            .to_vec();
         inputs[1] = version.get_overlaps(level + 1, &range_smallest, &range_largest);
     }
 
-    // 计算祖父层重叠（用于 5.4 切分控制）。
+    // 计算祖父层重叠（用于 5.4 切分控制）。取所有输入文件（本层+下一层）的并集区间。
     let grandparents = if level + 2 < NUM_LEVELS && !inputs[0].is_empty() {
-        version.get_overlaps(level + 2, self_smallest(&inputs), self_largest(&inputs))
+        let all_files: Vec<&FileMetaData> = inputs.iter().flat_map(|v| v.iter()).collect();
+        let gp_smallest = all_files
+            .iter()
+            .map(|f| f.smallest.user_key.as_slice())
+            .min()
+            .unwrap();
+        let gp_largest = all_files
+            .iter()
+            .map(|f| f.largest.user_key.as_slice())
+            .max()
+            .unwrap();
+        version.get_overlaps(level + 2, gp_smallest, gp_largest)
     } else {
         Vec::new()
     };
@@ -192,24 +198,6 @@ pub fn pick_compaction(version: &Version, vs: &VersionSet) -> Option<Compaction>
         inputs,
         grandparents,
     })
-}
-
-fn self_smallest(inputs: &[Vec<FileMetaData>]) -> &[u8] {
-    for level_files in inputs {
-        if let Some(f) = level_files.first() {
-            return &f.smallest.user_key;
-        }
-    }
-    &[]
-}
-
-fn self_largest(inputs: &[Vec<FileMetaData>]) -> &[u8] {
-    for level_files in inputs.iter().rev() {
-        if let Some(f) = level_files.last() {
-            return &f.largest.user_key;
-        }
-    }
-    &[]
 }
 
 /// 祖父层重叠超过此阈值时切分输出文件（防下次 compaction 一次捞太多）。
@@ -525,7 +513,7 @@ mod tests {
         let mut all = l0_files.iter().map(|f| (0, f.clone())).collect::<Vec<_>>();
         all.push((1, l1_file));
         let (vs, _dir) = vs_with_files(&all);
-        let compaction = pick_compaction(&vs.current(), &vs).unwrap();
+        let compaction = pick_compaction(&vs).unwrap();
         assert_eq!(compaction.level, 0);
         assert_eq!(compaction.inputs[0].len(), 5, "L0 全选");
         assert_eq!(compaction.inputs[1].len(), 1, "L1 重叠选 1 个");
@@ -545,7 +533,7 @@ mod tests {
         let mut all = l1_files.iter().map(|f| (1, f.clone())).collect::<Vec<_>>();
         all.push((2, l2_file));
         let (vs, _dir) = vs_with_files(&all);
-        let compaction = pick_compaction(&vs.current(), &vs).unwrap();
+        let compaction = pick_compaction(&vs).unwrap();
         assert_eq!(compaction.level, 1);
         assert_eq!(compaction.inputs[0].len(), 1, "L1 选 1 个文件");
         assert_eq!(compaction.inputs[0][0].number, FileNumber(1));
@@ -564,7 +552,7 @@ mod tests {
         let (mut vs, _dir) = vs_with_files(&all);
         // 设 pointer 为 "c"：第一个文件 largest="c" 不 > "c"，跳过；选第二个。
         vs.set_compact_pointer(1, b"c".to_vec());
-        let compaction = pick_compaction(&vs.current(), &vs).unwrap();
+        let compaction = pick_compaction(&vs).unwrap();
         assert_eq!(compaction.inputs[0][0].number, FileNumber(2));
     }
 
@@ -573,7 +561,7 @@ mod tests {
         // L1 compaction，key "k" 只在 L1 出现，L2+ 无 → is_base = true。
         let l1_file = meta(1, 100, b"k", b"k");
         let (vs, _dir) = vs_with_files(&[(1, l1_file)]);
-        let compaction = pick_compaction(&vs.current(), &vs).unwrap();
+        let compaction = pick_compaction(&vs).unwrap();
         assert!(compaction.is_base_level_for_user_key(&vs.current(), b"k"));
     }
 
@@ -583,7 +571,7 @@ mod tests {
         let l1_file = meta(1, 100, b"k", b"k");
         let l3_file = meta(3, 100, b"k", b"k");
         let (vs, _dir) = vs_with_files(&[(1, l1_file), (3, l3_file)]);
-        let compaction = pick_compaction(&vs.current(), &vs).unwrap();
+        let compaction = pick_compaction(&vs).unwrap();
         assert!(!compaction.is_base_level_for_user_key(&vs.current(), b"k"));
     }
 
@@ -593,7 +581,7 @@ mod tests {
         let l1_file = meta(1, 100, b"k", b"k");
         let l2_file = meta(2, 100, b"k", b"k"); // 下一层，不影响 is_base
         let (vs, _dir) = vs_with_files(&[(1, l1_file), (2, l2_file)]);
-        let compaction = pick_compaction(&vs.current(), &vs).unwrap();
+        let compaction = pick_compaction(&vs).unwrap();
         assert!(compaction.is_base_level_for_user_key(&vs.current(), b"k"));
     }
 
@@ -630,7 +618,7 @@ mod tests {
         let l0 = meta(1, 100, b"a", b"z");
         let l1 = meta(2, 100, b"a", b"z");
         let (vs, _dir) = vs_with_files(&[(0, l0), (1, l1)]);
-        let compaction = pick_compaction(&vs.current(), &vs).unwrap();
+        let compaction = pick_compaction(&vs).unwrap();
         let nums = compaction.input_file_numbers();
         assert!(nums.contains(&(0, FileNumber(1))));
         assert!(nums.contains(&(1, FileNumber(2))));
