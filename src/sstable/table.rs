@@ -217,7 +217,7 @@ impl TableBuilder {
 
 /// SSTable 读取器。打开文件后支持 get(user_key)。
 pub struct TableReader {
-    /// 整个文件读进内存。第一版简化（大 SSTable 可改为按需读 block）。
+    /// 整个文件读进内存。大 SSTable 可改为按需读 block（性能优化）。
     data: Vec<u8>,
     index_handle: BlockHandle,
     /// 布隆过滤器，读 data block 前先过滤。

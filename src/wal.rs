@@ -19,9 +19,8 @@ pub const HEADER_SIZE: usize = 7;
 /// 单个 record 可承载的最大数据长度。
 pub const DATA_MAX: usize = BLOCK_SIZE - HEADER_SIZE;
 
-/// record 分片类型。
-/// 第一版只实现 FULL（单条数据 < DATA_MAX，不分片）。
-/// FIRST/MIDDLE/LAST 用于大 record 跨 block 分片，留作后续进阶。
+/// record 分片类型。单个 record 数据 < DATA_MAX 时用 FULL；
+/// 超过时由 WalWriter 切成 FIRST/MIDDLE/LAST 分片。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RecordType {
@@ -450,7 +449,7 @@ mod tests {
     }
 
     /// 扫描文件，按 record 头解析，返回每条 record 的 (type, data)。
-    /// 仅供测试验证字节布局，不拼装分片（拼装在 2.2 的 reader 做）。
+    /// 仅供测试验证字节布局，不拼装分片（拼装在 reader 的 read_records 做）。
     fn scan_records(bytes: &[u8]) -> Vec<(RecordType, Vec<u8>)> {
         let mut out = Vec::new();
         let mut pos = 0;

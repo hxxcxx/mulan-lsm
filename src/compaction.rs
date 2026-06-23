@@ -72,7 +72,8 @@ pub struct Compaction {
     pub level: usize,
     pub inputs: [Vec<FileMetaData>; 2],
     /// 祖父层（level+2）中与本 compaction 区间重叠的文件。
-    /// 用于 5.4 的输出切分控制（与祖父重叠超阈值时切新文件）。
+    /// 用于输出切分控制：与祖父层重叠累计大小超阈值时切新输出文件，
+    /// 防止单次 compaction 输出与祖父层过度重叠（避免下次 compaction 输入过多）。
     pub grandparents: Vec<FileMetaData>,
 }
 
@@ -175,7 +176,7 @@ pub fn pick_compaction(vs: &VersionSet) -> Option<Compaction> {
         inputs[1] = version.get_overlaps(level + 1, &range_smallest, &range_largest);
     }
 
-    // 计算祖父层重叠（用于 5.4 切分控制）。取所有输入文件（本层+下一层）的并集区间。
+    // 计算祖父层重叠（供输出切分控制用）。取所有输入文件（本层+下一层）的并集区间。
     let grandparents = if level + 2 < NUM_LEVELS && !inputs[0].is_empty() {
         let all_files: Vec<&FileMetaData> = inputs.iter().flat_map(|v| v.iter()).collect();
         let gp_smallest = all_files

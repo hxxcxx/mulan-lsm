@@ -97,7 +97,7 @@ fn parse_number(s: &str) -> Option<FileNumber> {
     s.parse::<u64>().ok().map(FileNumber)
 }
 
-/// 单个 SSTable 的元数据。`Version` / `VersionEdit` / 后续 `Compaction` 三处共用同一组字段。
+/// 单个 SSTable 的元数据。`Version` / `VersionEdit` / `Compaction` 三处共用同一组字段。
 ///
 /// `smallest`/`largest` 是该文件内 internal key 的最小/最大值（按 `InternalKey` Ord），
 /// 用于 L1+ 的二分定位和 compaction 选文件。`allowed_seeks` 是 compaction 的 seek 节流计数，

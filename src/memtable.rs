@@ -225,8 +225,9 @@ mod tests {
         assert_eq!(m.sequence(), 3);
     }
 
-    /// 跨边界回归测试：曾经 1.4 的取反方案在 seq=255 处崩溃。
-    /// 这里连续 put 到 seq 远超 255，证明 Ord 方案正确。
+    /// 跨边界回归测试：曾经 InternalKey 用按位取反方案做排序键时，
+    /// 在 seq=255 处崩溃（小端字节序与整数序不一致）。这里连续 put 到 seq 远超 255，
+    /// 证明当前的 Ord 比较器方案在跨字节边界下正确。
     #[test]
     fn get_works_across_seq_byte_boundary() {
         let mut m = MemTable::new();
