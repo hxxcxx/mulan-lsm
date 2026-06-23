@@ -210,13 +210,11 @@ impl VersionSet {
         self.compact_pointer[level] = key;
     }
 
-    /// 获取快照：记录当前 last_sequence，作为一致性读的时间点。
-    /// 返回的 seq 后续用于读路径（只看 ≤ 该 seq 的版本）和释放注销。
+    /// 注册一个快照：把指定 seq 加入活跃列表。
+    /// seq 由调用方提供（DB 传 MemTable 的最新 seq，而非 last_sequence——后者只在 flush 时同步）。
     /// 调用方需保证持锁调用（快照注册是 VersionSet 状态变更）。
-    pub fn acquire_snapshot(&mut self) -> u64 {
-        let seq = self.last_sequence;
+    pub fn acquire_snapshot(&mut self, seq: u64) {
         self.snapshots.push(seq);
-        seq
     }
 
     /// 释放快照：从活跃列表移除该 seq。调用方需保证持锁。
@@ -405,14 +403,14 @@ mod tests {
 
     #[test]
     fn snapshot_acquire_returns_current_sequence() {
-        // 获取快照时，返回的 seq 应等于当时 last_sequence。
+        // 注册快照后，oldest 应反映该 seq。
         let dir = tmp_dir("snap-acquire");
         let mut vs = VersionSet::new_pending(&dir, FileNumber(1)).unwrap();
         let mut e = VersionEdit::new();
         e.set_next_file_number(2).set_last_sequence(42);
         vs.write_new_version(&e).unwrap();
-        let snap_seq = vs.acquire_snapshot();
-        assert_eq!(snap_seq, 42);
+        vs.acquire_snapshot(42);
+        assert_eq!(vs.oldest_snapshot_seq(), 42);
     }
 
     #[test]
@@ -423,13 +421,15 @@ mod tests {
         let mut e = VersionEdit::new();
         e.set_next_file_number(2).set_last_sequence(10);
         vs.write_new_version(&e).unwrap();
-        let s1 = vs.acquire_snapshot(); // seq=10
-                                        // 推进 last_sequence 到 20，再获取快照。
+        let s1 = 10u64;
+        vs.acquire_snapshot(s1);
+        // 推进 last_sequence 到 20，再注册一个 seq=20 的快照。
         let mut e2 = VersionEdit::new();
         e2.set_last_sequence(20);
         vs.write_new_version(&e2).unwrap();
-        let s2 = vs.acquire_snapshot(); // seq=20
-                                        // oldest 应是较小的 10。
+        let s2 = 20u64;
+        vs.acquire_snapshot(s2);
+        // oldest 应是较小的 10。
         assert_eq!(vs.oldest_snapshot_seq(), 10);
         // 释放 s1 后 oldest 变成 20。
         vs.release_snapshot(s1);
@@ -455,7 +455,8 @@ mod tests {
         let mut e = VersionEdit::new();
         e.set_next_file_number(2).set_last_sequence(5);
         vs.write_new_version(&e).unwrap();
-        let s = vs.acquire_snapshot();
+        let s = 5u64;
+        vs.acquire_snapshot(s);
         vs.release_snapshot(s);
         vs.release_snapshot(s); // 重复 release，不应 panic
         assert_eq!(vs.oldest_snapshot_seq(), MAX_SEQUENCE);

@@ -268,13 +268,18 @@ impl Db {
         self.inner.0.lock().unwrap().version_set.current()
     }
 
-    /// 获取一致性快照：固定当前 last_sequence 作为读时间点。
+    /// 获取一致性快照：固定当前最新已分配的 seq 作为读时间点。
+    /// seq 取自 MemTable（每次写入递增），而非 VersionSet.last_sequence（只在 flush 时同步）——
+    /// 这样快照能看到 memtable 中尚未 flush 的写入。
     /// 返回的 SnapshotGuard drop 时自动释放。快照存在期间，compaction 不会回收
     /// seq > 快照 seq 的旧版本，保证快照读到的一致性视图稳定。
     pub fn new_snapshot(&self) -> SnapshotGuard {
         let (lock, _) = &*self.inner;
         let mut inner = lock.lock().unwrap();
-        let seq = inner.version_set.acquire_snapshot();
+        // seq 取自 MemTable（每次写入递增），而非 VersionSet.last_sequence（只在 flush 时同步）——
+        // 这样快照能看到 memtable 中尚未 flush 的写入。
+        let seq = inner.memtable.sequence();
+        inner.version_set.acquire_snapshot(seq);
         SnapshotGuard {
             seq,
             inner: self.inner.clone(),
@@ -930,8 +935,8 @@ mod tests {
         } // snap 在此 drop
         assert_eq!(
             db.oldest_snapshot_seq(),
-            u64::MAX,
-            "快照释放后 oldest 应恢复 MAX"
+            crate::internal_key::MAX_SEQUENCE,
+            "快照释放后 oldest 应恢复 MAX_SEQUENCE"
         );
     }
 
@@ -950,7 +955,7 @@ mod tests {
         assert_eq!(db.oldest_snapshot_seq(), 2);
 
         drop(snap2);
-        assert_eq!(db.oldest_snapshot_seq(), u64::MAX);
+        assert_eq!(db.oldest_snapshot_seq(), crate::internal_key::MAX_SEQUENCE);
     }
 
     #[test]
