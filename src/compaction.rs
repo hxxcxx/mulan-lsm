@@ -1,6 +1,7 @@
 //! Compaction：后台归并的触发、选文件、执行。
 
-use crate::file_meta::{FileMetaData, FileNumber};
+use crate::error::Result;
+use crate::file_meta::{sst_path, FileMetaData, FileNumber, IdGenerator};
 use crate::internal_key::{
     user_key_of_internal_key, vtype_of_internal_key, InternalKey, ValueType,
 };
@@ -69,10 +70,10 @@ pub fn level0_needs_slowdown(version: &Version) -> bool {
 /// L1+ compaction 时 inputs[0] 通常只有 1 个文件。
 pub struct Compaction {
     pub level: usize,
-    pub inputs: [Vec<crate::file_meta::FileMetaData>; 2],
+    pub inputs: [Vec<FileMetaData>; 2],
     /// 祖父层（level+2）中与本 compaction 区间重叠的文件。
     /// 用于 5.4 的输出切分控制（与祖父重叠超阈值时切新文件）。
-    pub grandparents: Vec<crate::file_meta::FileMetaData>,
+    pub grandparents: Vec<FileMetaData>,
 }
 
 impl Compaction {
@@ -135,7 +136,7 @@ pub fn pick_compaction(version: &Version, vs: &VersionSet) -> Option<Compaction>
         return None;
     }
 
-    let mut inputs: [Vec<crate::file_meta::FileMetaData>; 2] = [Vec::new(), Vec::new()];
+    let mut inputs: [Vec<FileMetaData>; 2] = [Vec::new(), Vec::new()];
 
     if level == 0 {
         // L0：选全部 L0 文件（它们区间可能重叠，归并时必须全选）。
@@ -193,7 +194,7 @@ pub fn pick_compaction(version: &Version, vs: &VersionSet) -> Option<Compaction>
     })
 }
 
-fn self_smallest(inputs: &[Vec<crate::file_meta::FileMetaData>]) -> &[u8] {
+fn self_smallest(inputs: &[Vec<FileMetaData>]) -> &[u8] {
     for level_files in inputs {
         if let Some(f) = level_files.first() {
             return &f.smallest.user_key;
@@ -234,13 +235,13 @@ pub fn do_compaction(
     dir: &std::path::Path,
     compaction: &Compaction,
     version: &Version,
-    id_gen: &mut crate::file_meta::IdGenerator,
-) -> crate::error::Result<CompactionOutput> {
+    id_gen: &mut IdGenerator,
+) -> Result<CompactionOutput> {
     // 1. 为每个输入文件开 TableIter，collect 成 Vec 后包成 VecIterator（避开生命周期）。
     let mut iters: Vec<Box<dyn LsmIterator>> = Vec::new();
     for level_files in &compaction.inputs {
         for f in level_files {
-            let reader = TableReader::open(&crate::file_meta::sst_path(dir, f.number))?;
+            let reader = TableReader::open(&sst_path(dir, f.number))?;
             let items: Vec<(Vec<u8>, Vec<u8>)> = reader.iter().collect();
             iters.push(Box::new(VecIterator::new(items)));
         }
@@ -269,7 +270,7 @@ pub fn do_compaction(
         if current_builder.is_none() {
             let num = id_gen.new_file_number();
             current_file_number = Some(num);
-            let file = std::fs::File::create(crate::file_meta::sst_path(dir, num))?;
+            let file = std::fs::File::create(sst_path(dir, num))?;
             current_builder = Some(TableBuilder::new(file));
             current_smallest = Some(ik.clone());
             current_largest = Some(ik.clone());
@@ -301,7 +302,7 @@ pub fn do_compaction(
             new_files.push(meta);
             let num = id_gen.new_file_number();
             current_file_number = Some(num);
-            let file = std::fs::File::create(crate::file_meta::sst_path(dir, num))?;
+            let file = std::fs::File::create(sst_path(dir, num))?;
             current_builder = Some(TableBuilder::new(file));
             current_smallest = Some(ik.clone());
             current_largest = Some(ik.clone());
@@ -360,7 +361,7 @@ fn continue_with_entry(
     ik_bytes: &[u8],
     value: &[u8],
     current_largest: &mut Option<InternalKey>,
-) -> crate::error::Result<()> {
+) -> Result<()> {
     let b = builder.as_mut().unwrap();
     b.add(user_key, ik_bytes, value)?;
     *current_largest = Some(InternalKey::decode(ik_bytes)?);
@@ -374,11 +375,11 @@ fn finish_current(
     number: Option<FileNumber>,
     smallest: &Option<InternalKey>,
     largest: &Option<InternalKey>,
-) -> crate::error::Result<FileMetaData> {
+) -> Result<FileMetaData> {
     let b = builder.take().unwrap();
     b.finish()?;
     let num = number.unwrap();
-    let file_size = std::fs::metadata(crate::file_meta::sst_path(dir, num))?.len();
+    let file_size = std::fs::metadata(sst_path(dir, num))?.len();
     Ok(FileMetaData::new(
         num,
         file_size,

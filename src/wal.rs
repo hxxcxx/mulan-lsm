@@ -78,9 +78,8 @@ pub fn encode_full(buf: &mut Vec<u8>, data: &[u8]) {
 pub fn decode_header(buf: &[u8; HEADER_SIZE]) -> Result<RecordHeader> {
     let checksum = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let length = u16::from_le_bytes([buf[4], buf[5]]);
-    let rtype = RecordType::from_u8(buf[6]).ok_or_else(|| {
-        MulanError::Corrupted(format!("unknown record type: {}", buf[6]))
-    })?;
+    let rtype = RecordType::from_u8(buf[6])
+        .ok_or_else(|| MulanError::Corrupted(format!("unknown record type: {}", buf[6])))?;
     Ok(RecordHeader {
         checksum,
         length,
@@ -315,12 +314,7 @@ pub struct WalEntry {
 /// 布局：vtype(1) | seq(8, 小端) | key_len(varint) | key | val_len(varint) | val
 /// seq 直接落地（不取反），因为 WAL 不参与排序，只是顺序回放。
 /// Delete 的 value 编码为空（val_len=0）。
-pub fn encode_entry(
-    vtype: ValueType,
-    seq: u64,
-    key: &[u8],
-    value: &[u8],
-) -> Vec<u8> {
+pub fn encode_entry(vtype: ValueType, seq: u64, key: &[u8], value: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(9 + key.len() + value.len());
     buf.push(vtype as u8);
     buf.extend_from_slice(&seq.to_le_bytes());

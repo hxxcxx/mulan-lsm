@@ -90,10 +90,7 @@ impl MemTable {
 
     /// flush 并额外返回首/尾 internal key，供 DB 构造 `FileMetaData` 的 smallest/largest。
     /// 跳表按 `InternalKey` Ord 有序，首条即 smallest、末条即 largest。
-    pub fn flush_to_sstable_with_bounds(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<FlushResult> {
+    pub fn flush_to_sstable_with_bounds(&self, path: &std::path::Path) -> Result<FlushResult> {
         let file = std::fs::File::create(path)?;
         let mut builder = TableBuilder::new(file);
         let mut smallest: Option<InternalKey> = None;

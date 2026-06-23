@@ -406,9 +406,7 @@ impl<'a> Iterator for TableIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::internal_key::{
-        internal_key_cmp, InternalKey, ValueType,
-    };
+    use crate::internal_key::{internal_key_cmp, InternalKey, ValueType};
     use std::path::PathBuf;
 
     static DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -742,8 +740,7 @@ mod tests {
         // 严格按 internal_key_cmp 升序。
         for w in collected.windows(2) {
             assert!(
-                internal_key_cmp(&w[0].0, &w[1].0)
-                    != std::cmp::Ordering::Greater,
+                internal_key_cmp(&w[0].0, &w[1].0) != std::cmp::Ordering::Greater,
                 "entries not in ascending order"
             );
         }
