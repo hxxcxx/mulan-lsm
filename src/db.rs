@@ -26,6 +26,12 @@ use std::sync::{Arc, Condvar, Mutex};
 #[derive(Debug, Clone)]
 pub struct Options {
     pub memtable_flush_entries: usize,
+    /// 单个 SSTable data block 目标大小（字节）。越小越稀疏，点查更快但空间放大。
+    pub block_size: usize,
+    /// 布隆过滤器每个 key 占用的位数。越大假阳性越低但文件越大。
+    pub bloom_bits_per_key: usize,
+    /// TableCache 最大缓存条目数。0 表示不缓存（每次 get 都打开文件）。
+    pub table_cache_size: usize,
     /// 禁用后台自动 compaction（测试用，配合 `compact_once` 手动控制）。
     pub disable_auto_compaction: bool,
 }
@@ -34,6 +40,9 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             memtable_flush_entries: 1000,
+            block_size: 4 * 1024,
+            bloom_bits_per_key: 10,
+            table_cache_size: 100,
             disable_auto_compaction: false,
         }
     }
@@ -86,6 +95,7 @@ impl Db {
     pub fn open(dir: &Path, options: Options) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let auto_compact = !options.disable_auto_compaction;
+        let cache_size = options.table_cache_size;
         let db_inner: DbInner = if current_path(dir).exists() {
             Self::recover_open(dir, options)?
         } else {
@@ -99,7 +109,14 @@ impl Db {
             Self::create_new(dir, options)?
         };
         let inner = Arc::new((Mutex::new(db_inner), Condvar::new()));
-        let table_cache = Arc::new(TableCache::new(dir.to_path_buf()));
+        let table_cache = if cache_size > 0 {
+            Arc::new(TableCache::with_capacity(
+                dir.to_path_buf(),
+                cache_size,
+            ))
+        } else {
+            Arc::new(TableCache::with_capacity(dir.to_path_buf(), 0))
+        };
         let bg_thread = if auto_compact {
             let c = inner.clone();
             let cache = table_cache.clone();
@@ -164,7 +181,11 @@ impl Db {
             let path = sst_path(dir, sst);
             let FlushResult {
                 smallest, largest, ..
-            } = memtable.flush_to_sstable_with_bounds(&path)?;
+            } = memtable.flush_to_sstable_with_options(
+                &path,
+                options.block_size,
+                options.bloom_bits_per_key,
+            )?;
             let sz = std::fs::metadata(&path)?.len();
             let (s, l) = match (smallest, largest) {
                 (Some(s), Some(l)) => (s, l),
@@ -416,7 +437,11 @@ fn flush_memtable(inner: &mut DbInner) -> Result<()> {
     let path = sst_path(&inner.dir, sst);
     let FlushResult {
         smallest, largest, ..
-    } = frozen.flush_to_sstable_with_bounds(&path)?;
+    } = frozen.flush_to_sstable_with_options(
+        &path,
+        inner.options.block_size,
+        inner.options.bloom_bits_per_key,
+    )?;
     let sz = std::fs::metadata(&path)?.len();
     let (s, l) = match (smallest, largest) {
         (Some(s), Some(l)) => (s, l),
@@ -609,6 +634,7 @@ mod tests {
         Options {
             memtable_flush_entries: 5,
             disable_auto_compaction: true,
+            ..Default::default()
         }
     }
 
@@ -965,6 +991,7 @@ mod tests {
         let opts = Options {
             memtable_flush_entries: 5,
             disable_auto_compaction: false,
+            ..Default::default()
         };
         let db = Db::open(&dir, opts).unwrap();
         // 写入 200 条（40 次 flush），后台应自动 compaction。
@@ -995,6 +1022,7 @@ mod tests {
         let opts = Options {
             memtable_flush_entries: 5,
             disable_auto_compaction: false,
+            ..Default::default()
         };
         let handle = {
             let db = Db::open(&dir, opts).unwrap();

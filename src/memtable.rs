@@ -96,14 +96,26 @@ impl MemTable {
 
     /// 把 MemTable 的全部内容刷成一个 SSTable 文件，返回条目数。
     pub fn flush_to_sstable(&self, path: &std::path::Path) -> Result<u64> {
-        Ok(self.flush_to_sstable_with_bounds(path)?.num_entries)
+        self.flush_to_sstable_with_bounds(path)
+            .map(|r| r.num_entries)
     }
 
     /// flush 并额外返回首/尾 internal key，供 DB 构造 `FileMetaData` 的 smallest/largest。
     /// 跳表按 `InternalKey` Ord 有序，首条即 smallest、末条即 largest。
+    /// 使用默认的 block_target（4KB）和 bits_per_key（10）。
     pub fn flush_to_sstable_with_bounds(&self, path: &std::path::Path) -> Result<FlushResult> {
+        self.flush_to_sstable_with_options(path, 4 * 1024, 10)
+    }
+
+    /// 同 `flush_to_sstable_with_bounds`，但可指定 data block 目标大小和布隆精度。
+    pub fn flush_to_sstable_with_options(
+        &self,
+        path: &std::path::Path,
+        block_target: usize,
+        bits_per_key: usize,
+    ) -> Result<FlushResult> {
         let file = std::fs::File::create(path)?;
-        let mut builder = TableBuilder::new(file);
+        let mut builder = TableBuilder::with_options(file, block_target, bits_per_key);
         let mut smallest: Option<InternalKey> = None;
         let mut largest: Option<InternalKey> = None;
         for (ik, value) in self.skiplist.iter() {

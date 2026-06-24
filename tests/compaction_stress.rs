@@ -29,6 +29,7 @@ fn differential_test_with_overwrites_and_deletes() {
         Options {
             memtable_flush_entries: 20,
             disable_auto_compaction: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -84,6 +85,7 @@ fn level_structure_stabilizes_after_churn() {
         Options {
             memtable_flush_entries: 10,
             disable_auto_compaction: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -128,6 +130,7 @@ fn delete_then_compact_removes_all_data() {
             Options {
                 memtable_flush_entries: 10,
                 disable_auto_compaction: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -155,6 +158,7 @@ fn delete_then_compact_removes_all_data() {
         Options {
             memtable_flush_entries: 10,
             disable_auto_compaction: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -203,6 +207,7 @@ fn reopen_after_heavy_churn_preserves_data() {
             Options {
                 memtable_flush_entries: 15,
                 disable_auto_compaction: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -220,6 +225,7 @@ fn reopen_after_heavy_churn_preserves_data() {
         Options {
             memtable_flush_entries: 15,
             disable_auto_compaction: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -238,6 +244,7 @@ fn million_keys_stress() {
         Options {
             memtable_flush_entries: 1000,
             disable_auto_compaction: false,
+            ..Default::default()
         },
     )
     .unwrap();

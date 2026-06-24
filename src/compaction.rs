@@ -1,4 +1,4 @@
-//! Compaction：后台归并的触发、选文件、执行。
+﻿//! Compaction：后台归并的触发、选文件、执行。
 
 use crate::error::Result;
 use crate::file_meta::{sst_path, FileMetaData, FileNumber, IdGenerator};
@@ -228,6 +228,8 @@ pub fn do_compaction(
     oldest_snapshot_seq: u64,
 ) -> Result<CompactionOutput> {
     // 1. 为每个输入文件开 TableIter，直接作为 LsmIterator 喂给归并（惰性，不全量 collect）。
+    let block_target = 4 * 1024; // DATA_BLOCK_TARGET
+    let bits_per_key = 10;
     let mut iters: Vec<Box<dyn LsmIterator>> = Vec::new();
     for level_files in &compaction.inputs {
         for f in level_files {
@@ -279,7 +281,7 @@ pub fn do_compaction(
             let num = id_gen.new_file_number();
             current_file_number = Some(num);
             let file = std::fs::File::create(sst_path(dir, num))?;
-            current_builder = Some(TableBuilder::new(file));
+            current_builder = Some(TableBuilder::with_options(file, block_target, bits_per_key));
             current_smallest = Some(ik.clone());
             current_largest = Some(ik.clone());
             current_grandparent_overlap = 0;
@@ -311,7 +313,7 @@ pub fn do_compaction(
             let num = id_gen.new_file_number();
             current_file_number = Some(num);
             let file = std::fs::File::create(sst_path(dir, num))?;
-            current_builder = Some(TableBuilder::new(file));
+            current_builder = Some(TableBuilder::with_options(file, block_target, bits_per_key));
             current_smallest = Some(ik.clone());
             current_largest = Some(ik.clone());
             current_grandparent_overlap = 0;

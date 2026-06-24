@@ -50,8 +50,13 @@ impl TableCache {
     ///
     /// 缓存命中 → 返回 clone 的 `Arc`；未命中 → 打开文件、加入缓存、返回。
     /// 缓存满时淘汰最久未用的条目。文件打开不在锁内进行，减少锁争用。
+    /// 容量为 0 时不缓存（每次直接打开文件，不进缓存）。
     pub fn get(&self, number: FileNumber) -> Result<Arc<TableReader>> {
         let inner = self.inner.lock().unwrap();
+        if inner.capacity == 0 {
+            drop(inner);
+            return Ok(Arc::new(TableReader::open(&sst_path(&self.dir, number))?));
+        }
         if let Some(reader) = inner.entries.get(&number) {
             return Ok(Arc::clone(reader));
         }
