@@ -271,37 +271,49 @@ impl TableReader {
     /// 流程：布隆过滤 → 哨兵 internal key → index 定位 data block → block 内 lower_bound → 校验 user_key。
     /// 按 user_key 查找 snapshot_seq 时间点的版本。
     /// 流程：布隆过滤 → 哨兵 internal key(seq=snapshot) → index 定位 data block → block 内 lower_bound → 校验 user_key。
-    pub fn get_entry(&self, user_key: &[u8], snapshot_seq: u64) -> Option<(ValueType, &[u8])> {
+    /// 返回 `Ok(None)` 表示 key 不存在；`Err(...)` 表示文件损坏等 I/O 级错误。
+    pub fn get_entry(
+        &self,
+        user_key: &[u8],
+        snapshot_seq: u64,
+    ) -> Result<Option<(ValueType, &[u8])>> {
         // 布隆过滤：user_key 肯定不在则直接返回 None，省掉读 data block。
         if let Some(bloom) = &self.bloom {
             if !bloom.may_contain(user_key) {
-                return None;
+                return Ok(None);
             }
         }
         // 哨兵：user_key + snapshot_seq。同 user_key 下命中的第一个 ≥ 哨兵的 entry 即 ≤ snapshot 的最新版本。
         let lookup = lookup_key(user_key, snapshot_seq);
         // index lower_bound 定位 data block（用 internal_key_cmp 比较）。
-        let index_bytes = self.block_bytes(&self.index_handle).ok()?;
-        let index_block = Block::new(index_bytes).ok()?;
-        let data_handle_bytes = index_block.lower_bound(&lookup, &|a, b| internal_key_cmp(a, b))?;
-        let (data_handle, _n) = BlockHandle::decode(data_handle_bytes).ok()?;
+        let index_bytes = self.block_bytes(&self.index_handle)?;
+        let index_block = Block::new(index_bytes)?;
+        let Some(data_handle_bytes) =
+            index_block.lower_bound(&lookup, &|a, b| internal_key_cmp(a, b))
+        else {
+            return Ok(None);
+        };
+        let (data_handle, _n) = BlockHandle::decode(data_handle_bytes)?;
         // data block 内 lower_bound，校验命中 entry 的 user_key 一致。
-        let data_block_bytes = self.block_bytes(&data_handle).ok()?;
-        let data_block = Block::new(data_block_bytes).ok()?;
-        let (found_key, value) =
-            data_block.lower_bound_kv(&lookup, &|a, b| internal_key_cmp(a, b))?;
+        let data_block_bytes = self.block_bytes(&data_handle)?;
+        let data_block = Block::new(data_block_bytes)?;
+        let Some((found_key, value)) =
+            data_block.lower_bound_kv(&lookup, &|a, b| internal_key_cmp(a, b))
+        else {
+            return Ok(None);
+        };
         if user_key_of_internal_key(&found_key) == user_key {
-            Some((vtype_of_internal_key(&found_key), value))
+            Ok(Some((vtype_of_internal_key(&found_key), value)))
         } else {
-            None
+            Ok(None)
         }
     }
 
-    /// 按 user_key 查找最新版本。删除标记视为不存在（返回 None）。
-    pub fn get(&self, user_key: &[u8]) -> Option<&[u8]> {
+    /// 按 user_key 查找最新版本。删除标记视为不存在（返回 `Ok(None)`）。
+    pub fn get(&self, user_key: &[u8]) -> Result<Option<&[u8]>> {
         match self.get_entry(user_key, crate::internal_key::MAX_SEQUENCE)? {
-            (ValueType::Put, value) => Some(value),
-            (ValueType::Delete, _) => None,
+            Some((ValueType::Put, value)) => Ok(Some(value)),
+            Some((ValueType::Delete, _)) | None => Ok(None),
         }
     }
 
@@ -511,7 +523,7 @@ mod tests {
         let expected = latest_value_per_user_key(&entries);
         for (user_key, value) in &expected {
             assert_eq!(
-                reader.get(user_key),
+                reader.get(user_key).unwrap(),
                 Some(value.as_slice()),
                 "missed user_key {user_key:?}"
             );
@@ -535,11 +547,11 @@ mod tests {
         let reader = TableReader::open(&path).unwrap();
         let expected = latest_value_per_user_key(&entries);
         for (user_key, value) in &expected {
-            assert_eq!(reader.get(user_key), Some(value.as_slice()));
+            assert_eq!(reader.get(user_key).unwrap(), Some(value.as_slice()));
         }
         // 未命中：不存在的 user_key（布隆应拦截）。
         let missing_user_key = (u32::MAX).to_be_bytes();
-        assert_eq!(reader.get(&missing_user_key), None);
+        assert_eq!(reader.get(&missing_user_key).unwrap(), None);
     }
 
     #[test]
@@ -556,7 +568,7 @@ mod tests {
 
         let reader = TableReader::open(&path).unwrap();
         // 完全不存在的 user_key。
-        assert_eq!(reader.get(b"zzz-not-exist"), None);
+        assert_eq!(reader.get(b"zzz-not-exist").unwrap(), None);
     }
 
     #[test]
@@ -608,15 +620,16 @@ mod tests {
         let reader = TableReader::open(&path).unwrap();
         // k1 最新版本是 Delete：get 返回 None（删除标记由上层解释为不存在），
         // get_entry 暴露 (Delete, 空) 以证明标记确实被存储。
-        assert_eq!(reader.get(b"k1"), None);
+        assert_eq!(reader.get(b"k1").unwrap(), None);
         assert_eq!(
             reader
                 .get_entry(b"k1", crate::internal_key::MAX_SEQUENCE)
+                .unwrap()
                 .map(|(t, v)| (t, v.len())),
             Some((ValueType::Delete, 0))
         );
         // k2 最新是 Put v2。
-        assert_eq!(reader.get(b"k2"), Some(b"v2".as_slice()));
+        assert_eq!(reader.get(b"k2").unwrap(), Some(b"v2".as_slice()));
     }
 
     #[test]
@@ -647,7 +660,7 @@ mod tests {
         // 存在的 key 全部命中。
         for (ik, value) in &entries {
             assert_eq!(
-                reader.get(&ik.user_key),
+                reader.get(&ik.user_key).unwrap(),
                 Some(value.as_slice()),
                 "present key missed: {:?}",
                 ik.user_key
@@ -656,7 +669,7 @@ mod tests {
         // 不存在的 key 全部返回 None。
         for i in 0..500u32 {
             let absent = format!("absent-{i}");
-            assert_eq!(reader.get(absent.as_bytes()), None);
+            assert_eq!(reader.get(absent.as_bytes()).unwrap(), None);
         }
     }
 
@@ -685,12 +698,12 @@ mod tests {
         let reader = TableReader::open(&path).unwrap();
         // 存在的 key 全部命中。
         for (ik, value) in &entries {
-            assert_eq!(reader.get(&ik.user_key), Some(value.as_slice()));
+            assert_eq!(reader.get(&ik.user_key).unwrap(), Some(value.as_slice()));
         }
         // 不存在的 key 全部返回 None。
         for i in 0..500u32 {
             let absent = format!("absent-{i}");
-            assert_eq!(reader.get(absent.as_bytes()), None);
+            assert_eq!(reader.get(absent.as_bytes()).unwrap(), None);
         }
     }
 
@@ -712,19 +725,20 @@ mod tests {
 
         let reader = TableReader::open(&path).unwrap();
         // key1 最新版本是 v1-updated。
-        assert_eq!(reader.get(b"key1"), Some(b"v1-updated".as_slice()));
+        assert_eq!(reader.get(b"key1").unwrap(), Some(b"v1-updated".as_slice()));
         // key2 最新是删除标记：get 返回 None，get_entry 暴露 (Delete, 空)。
-        assert_eq!(reader.get(b"key2"), None);
+        assert_eq!(reader.get(b"key2").unwrap(), None);
         assert_eq!(
             reader
                 .get_entry(b"key2", crate::internal_key::MAX_SEQUENCE)
+                .unwrap()
                 .map(|(t, v)| (t, v.len())),
             Some((ValueType::Delete, 0))
         );
         // key3 正常。
-        assert_eq!(reader.get(b"key3"), Some(b"v3".as_slice()));
+        assert_eq!(reader.get(b"key3").unwrap(), Some(b"v3".as_slice()));
         // 不存在的 key。
-        assert_eq!(reader.get(b"key4"), None);
+        assert_eq!(reader.get(b"key4").unwrap(), None);
     }
 
     #[test]

@@ -148,9 +148,9 @@ mod tests {
         let _r2 = cache.get(FileNumber(2)).unwrap();
         let _r3 = cache.get(FileNumber(3)).unwrap();
         // 全部可正常读取
-        assert_eq!(_r1.get(b"k"), Some(b"v".as_slice()));
-        assert_eq!(_r2.get(b"k"), Some(b"v".as_slice()));
-        assert_eq!(_r3.get(b"k"), Some(b"v".as_slice()));
+        assert_eq!(_r1.get(b"k").unwrap(), Some(b"v".as_slice()));
+        assert_eq!(_r2.get(b"k").unwrap(), Some(b"v".as_slice()));
+        assert_eq!(_r3.get(b"k").unwrap(), Some(b"v".as_slice()));
     }
 
     #[test]
@@ -159,6 +159,6 @@ mod tests {
         build_test_sst(&dir, FileNumber(1));
         let cache = TableCache::new(dir);
         let reader = cache.get(FileNumber(1)).unwrap();
-        assert_eq!(reader.get(b"k"), Some(b"v".as_slice()));
+        assert_eq!(reader.get(b"k").unwrap(), Some(b"v".as_slice()));
     }
 }

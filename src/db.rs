@@ -242,18 +242,17 @@ impl Db {
             maybe_schedule_compaction(&mut inner);
             inner = cvar.wait(inner).unwrap();
         }
-        match vtype {
-            ValueType::Put => inner.memtable.put(key, value),
-            ValueType::Delete => inner.memtable.delete(key),
-        }
-        let seq = inner.memtable.sequence();
+        // WAL 必须写成功后才更新 MemTable：崩溃恢复时 WAL 是唯一真相源。
+        // 先写 WAL 再写 MemTable 保证崩溃时不会出现"MemTable 有但 WAL 无"的数据丢失窗口。
+        let seq = inner.memtable.sequence() + 1;
+        inner
+            .wal
+            .add_record(&encode_entry(vtype, seq, key, value))?;
+        inner.memtable.apply(vtype, seq, key, value);
         // write 立即推进 last_sequence，使其成为 seq 的唯一权威源（快照直接取它，
         // 避免 memtable.sequence 与 last_sequence 两个源头不一致）。
         // 持久化仍由 flush 时的 edit.set_last_sequence 完成；崩溃未 flush 的写入靠 WAL 回放恢复。
         inner.version_set.last_sequence = seq;
-        inner
-            .wal
-            .add_record(&encode_entry(vtype, seq, key, value))?;
         if inner.memtable.num_entries() >= inner.options.memtable_flush_entries {
             flush_memtable(&mut inner)?;
         }
@@ -277,7 +276,7 @@ impl Db {
         // 先查 L0（最新文件优先），再查 L1+（二分定位）。
         for meta in version.files_at(0).iter().rev() {
             let r = self.table_cache.get(meta.number)?;
-            if let Some((vt, v)) = r.get_entry(key, snapshot) {
+            if let Some((vt, v)) = r.get_entry(key, snapshot)? {
                 return Ok(match vt {
                     ValueType::Put => Some(v.to_vec()),
                     ValueType::Delete => None,
@@ -287,7 +286,7 @@ impl Db {
         for level in 1..NUM_LEVELS {
             if let Some(meta) = find_file_for_key(version.files_at(level), key) {
                 let r = self.table_cache.get(meta.number)?;
-                if let Some((vt, v)) = r.get_entry(key, snapshot) {
+                if let Some((vt, v)) = r.get_entry(key, snapshot)? {
                     return Ok(match vt {
                         ValueType::Put => Some(v.to_vec()),
                         ValueType::Delete => None,
@@ -313,7 +312,7 @@ impl Db {
         drop(inner);
         for meta in version.files_at(0).iter().rev() {
             let r = self.table_cache.get(meta.number)?;
-            if let Some((vt, v)) = r.get_entry(key, snap_seq) {
+            if let Some((vt, v)) = r.get_entry(key, snap_seq)? {
                 return Ok(match vt {
                     ValueType::Put => Some(v.to_vec()),
                     ValueType::Delete => None,
@@ -323,7 +322,7 @@ impl Db {
         for level in 1..NUM_LEVELS {
             if let Some(meta) = find_file_for_key(version.files_at(level), key) {
                 let r = self.table_cache.get(meta.number)?;
-                if let Some((vt, v)) = r.get_entry(key, snap_seq) {
+                if let Some((vt, v)) = r.get_entry(key, snap_seq)? {
                     return Ok(match vt {
                         ValueType::Put => Some(v.to_vec()),
                         ValueType::Delete => None,
@@ -490,7 +489,17 @@ fn run_one_compaction(
     let oldest = inner.version_set.oldest_snapshot_seq();
     let start = inner.id_gen.next_number();
     let mut id_gen = IdGenerator::new(start);
-    let output = do_compaction(&dir, &compaction, &version, &mut id_gen, oldest)?;
+    let block_target = inner.options.block_size;
+    let bits_per_key = inner.options.bloom_bits_per_key;
+    let output = do_compaction(
+        &dir,
+        &compaction,
+        &version,
+        &mut id_gen,
+        oldest,
+        block_target,
+        bits_per_key,
+    )?;
     inner.id_gen.bump_to(id_gen.next_number());
     let mut edit = VersionEdit::new();
     for f in &output.new_files {
@@ -554,7 +563,9 @@ fn background_compaction(inner: Arc<(Mutex<DbInner>, Condvar)>, cache: Arc<Table
         if guard.shutting_down {
             break;
         }
-        let _ = run_one_compaction(&mut guard, &cache);
+        if let Err(e) = run_one_compaction(&mut guard, &cache) {
+            eprintln!("background compaction error: {e}");
+        }
         guard.bg_compaction_scheduled = false;
         cvar.notify_all();
     }

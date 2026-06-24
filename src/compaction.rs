@@ -1,6 +1,6 @@
 ﻿//! Compaction：后台归并的触发、选文件、执行。
 
-use crate::error::Result;
+use crate::error::{MulanError, Result};
 use crate::file_meta::{sst_path, FileMetaData, FileNumber, IdGenerator};
 use crate::internal_key::{
     user_key_of_internal_key, vtype_of_internal_key, InternalKey, ValueType,
@@ -226,10 +226,10 @@ pub fn do_compaction(
     version: &Version,
     id_gen: &mut IdGenerator,
     oldest_snapshot_seq: u64,
+    block_target: usize,
+    bits_per_key: usize,
 ) -> Result<CompactionOutput> {
     // 1. 为每个输入文件开 TableIter，直接作为 LsmIterator 喂给归并（惰性，不全量 collect）。
-    let block_target = 4 * 1024; // DATA_BLOCK_TARGET
-    let bits_per_key = 10;
     let mut iters: Vec<Box<dyn LsmIterator>> = Vec::new();
     for level_files in &compaction.inputs {
         for f in level_files {
@@ -389,7 +389,9 @@ fn continue_with_entry(
     value: &[u8],
     current_largest: &mut Option<InternalKey>,
 ) -> Result<()> {
-    let b = builder.as_mut().unwrap();
+    let b = builder
+        .as_mut()
+        .ok_or_else(|| MulanError::Corrupted("compaction builder missing".into()))?;
     b.add(user_key, ik_bytes, value)?;
     *current_largest = Some(InternalKey::decode(ik_bytes)?);
     Ok(())
@@ -403,15 +405,22 @@ fn finish_current(
     smallest: &Option<InternalKey>,
     largest: &Option<InternalKey>,
 ) -> Result<FileMetaData> {
-    let b = builder.take().unwrap();
+    let b = builder
+        .take()
+        .ok_or_else(|| MulanError::Corrupted("compaction builder missing at finish".into()))?;
     b.finish()?;
-    let num = number.unwrap();
+    let num = number
+        .ok_or_else(|| MulanError::Corrupted("compaction file number missing".into()))?;
     let file_size = std::fs::metadata(sst_path(dir, num))?.len();
     Ok(FileMetaData::new(
         num,
         file_size,
-        smallest.clone().unwrap(),
-        largest.clone().unwrap(),
+        smallest
+            .clone()
+            .ok_or_else(|| MulanError::Corrupted("compaction smallest key missing".into()))?,
+        largest
+            .clone()
+            .ok_or_else(|| MulanError::Corrupted("compaction largest key missing".into()))?,
     ))
 }
 
@@ -731,6 +740,8 @@ mod tests {
             &version,
             &mut id_gen,
             crate::internal_key::MAX_SEQUENCE,
+            4 * 1024,
+            10,
         )
         .unwrap();
         assert_eq!(output.new_files.len(), 1);
@@ -742,9 +753,9 @@ mod tests {
             output.new_files[0].number,
         ))
         .unwrap();
-        assert_eq!(reader.get(b"a"), Some(b"a2".as_slice()));
-        assert_eq!(reader.get(b"b"), Some(b"b1".as_slice()));
-        assert_eq!(reader.get(b"c"), Some(b"c2".as_slice()));
+        assert_eq!(reader.get(b"a").unwrap(), Some(b"a2".as_slice()));
+        assert_eq!(reader.get(b"b").unwrap(), Some(b"b1".as_slice()));
+        assert_eq!(reader.get(b"c").unwrap(), Some(b"c2".as_slice()));
     }
 
     #[test]
@@ -769,6 +780,8 @@ mod tests {
             &version,
             &mut id_gen,
             crate::internal_key::MAX_SEQUENCE,
+            4 * 1024,
+            10,
         )
         .unwrap();
         // 100 * 100KB = 10MB，应切出多个 ~2MB 文件。
@@ -821,6 +834,8 @@ mod tests {
             &version,
             &mut id_gen,
             crate::internal_key::MAX_SEQUENCE,
+            4 * 1024,
+            10,
         )
         .unwrap();
         // 修复正确：每条 entry 后都因 overlap>20MB 切分，应产生多个文件（>1）。
@@ -868,6 +883,8 @@ mod tests {
             &version,
             &mut id_gen,
             crate::internal_key::MAX_SEQUENCE,
+            4 * 1024,
+            10,
         )
         .unwrap();
         // 用迭代器数 entry：应该只有 1 条（最新 v3）。
@@ -911,6 +928,8 @@ mod tests {
             &version,
             &mut id_gen,
             crate::internal_key::MAX_SEQUENCE,
+            4 * 1024,
+            10,
         )
         .unwrap();
         // 删除标记被丢弃 + 唯一 entry 是删除标记 → 无 entry 写入 → 输出文件为空或不存在。
@@ -919,7 +938,7 @@ mod tests {
         if let Some(f) = output.new_files.first() {
             let reader = TableReader::open(&crate::file_meta::sst_path(&dir, f.number)).unwrap();
             assert_eq!(
-                reader.get(b"k"),
+                reader.get(b"k").unwrap(),
                 None,
                 "tombstone should be dropped at base level"
             );
