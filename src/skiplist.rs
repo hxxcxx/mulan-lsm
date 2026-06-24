@@ -79,8 +79,9 @@ impl<K: Ord, V> SkipList<K, V> {
     /// 从 head 最高层开始，逐层下降到第 0 层，记录每一层中
     /// "key 小于 target 的最后一个节点"作为插入前驱。
     /// 返回 prev[i] 即第 i 层新节点应插入位置的前驱索引。
-    fn find_prev(&self, key: &K) -> Vec<usize> {
-        let mut prev = vec![0; self.max_height];
+    /// 使用固定大小数组避免每次 insert 的堆分配。
+    fn find_prev(&self, key: &K) -> [usize; MAX_HEIGHT] {
+        let mut prev = [0usize; MAX_HEIGHT];
         let mut cur: usize = Self::HEAD;
         // 从最高层往下找：高层负责"跳"，底层负责"精确定位"。
         for level in (0..self.max_height).rev() {
@@ -151,13 +152,10 @@ impl<K: Ord, V> SkipList<K, V> {
     pub fn insert(&mut self, key: K, value: V) {
         let mut rng = rand::rng();
         let height = Self::random_height(&mut rng);
-        let mut prev = self.find_prev(&key);
+        let prev = self.find_prev(&key);
 
-        // 新节点比当前最高层还高：高层目前只有 head，那些层的前驱补成 head。
+        // 新节点比当前最高层还高：固定数组已预填 HEAD，直接扩展 max_height 即可。
         if height > self.max_height {
-            for _ in self.max_height..height {
-                prev.push(Self::HEAD);
-            }
             self.max_height = height;
         }
 

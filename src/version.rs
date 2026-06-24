@@ -148,6 +148,7 @@ impl VersionSet {
         let mut prev_log_number = 0;
         let mut next_file_number = 0;
         let mut last_sequence = 0;
+        let mut compact_pointer: [Vec<u8>; NUM_LEVELS] = std::array::from_fn(|_| Vec::new());
         for edit in &recovery.edits {
             version = apply_edit(&version, edit)?;
             if let Some(n) = edit.log_number {
@@ -162,6 +163,11 @@ impl VersionSet {
             if let Some(s) = edit.last_sequence {
                 last_sequence = s;
             }
+            for (level, key) in &edit.compact_pointers {
+                if (*level as usize) < NUM_LEVELS {
+                    compact_pointer[*level as usize] = key.clone();
+                }
+            }
         }
         let writer = ManifestWriter::create(dir, recovery.manifest_number)?;
         Ok(VersionSet {
@@ -172,7 +178,7 @@ impl VersionSet {
             last_sequence,
             manifest_number: recovery.manifest_number,
             manifest_writer: writer,
-            compact_pointer: std::array::from_fn(|_| Vec::new()),
+            compact_pointer,
             snapshots: Vec::new(),
         })
     }
@@ -196,6 +202,9 @@ impl VersionSet {
         }
         if let Some(s) = edit.last_sequence {
             self.last_sequence = s;
+        }
+        for (level, key) in &edit.compact_pointers {
+            self.compact_pointer[*level as usize] = key.clone();
         }
         Ok(self.current.clone())
     }
@@ -460,5 +469,26 @@ mod tests {
         vs.release_snapshot(s);
         vs.release_snapshot(s); // 重复 release，不应 panic
         assert_eq!(vs.oldest_snapshot_seq(), MAX_SEQUENCE);
+    }
+
+    /// 验证 compact_pointer 在 recover 后被正确恢复（不再重置为空）。
+    #[test]
+    fn recover_restores_compact_pointer() {
+        let dir = tmp_dir("cp-recover");
+        let mut vs = VersionSet::new_pending(&dir, FileNumber(1)).unwrap();
+        let mut e1 = VersionEdit::new();
+        e1.set_next_file_number(5)
+            .set_last_sequence(1)
+            .set_compact_pointer(2, b"cp-key".to_vec())
+            .set_compact_pointer(4, b"cp-other".to_vec());
+        vs.write_new_version(&e1).unwrap();
+        write_current(&dir, FileNumber(1)).unwrap();
+        drop(vs);
+
+        let recovered = VersionSet::recover(&dir).unwrap();
+        assert_eq!(recovered.compact_pointer(2), b"cp-key");
+        assert_eq!(recovered.compact_pointer(4), b"cp-other");
+        // 未设置的层应为空
+        assert!(recovered.compact_pointer(0).is_empty());
     }
 }

@@ -71,10 +71,8 @@ pub struct TableBuilder {
     finished: bool,
     /// data block 切分阈值。测试时可调小以精确控制 block 数。
     block_target: usize,
-    /// 收集所有 user_key，finish 时构建布隆。
-    user_keys: Vec<Vec<u8>>,
-    /// 布隆的 bits_per_key。
-    bits_per_key: usize,
+    /// 在线布隆：add 时直接插入，finish 时输出。无需收集全部 key，省内存。
+    bloom: BloomFilter,
 }
 
 /// metaindex block 中 filter 条目的 key。
@@ -90,6 +88,11 @@ impl TableBuilder {
     }
 
     pub fn with_options(file: std::fs::File, block_target: usize, bits_per_key: usize) -> Self {
+        // 在线布隆预分配：按 block_target 估算 SSTable 约容纳 50 个 data block、
+        // 每 block ~block_target/32 条 entry（保守估计 key+value 均长 32B）。
+        let estimated_keys = (50 * block_target / 32).max(1000);
+        let mut bloom = BloomFilter::new(bits_per_key);
+        bloom.ensure_capacity(estimated_keys, bits_per_key);
         TableBuilder {
             file,
             data_block: BlockBuilder::new(),
@@ -101,8 +104,7 @@ impl TableBuilder {
             num_entries: 0,
             finished: false,
             block_target,
-            user_keys: Vec::new(),
-            bits_per_key,
+            bloom,
         }
     }
 
@@ -124,7 +126,7 @@ impl TableBuilder {
         self.data_block.add(internal_key, value);
         self.last_key.clear();
         self.last_key.extend_from_slice(internal_key);
-        self.user_keys.push(user_key.to_vec());
+        self.bloom.insert(user_key);
         self.num_entries += 1;
 
         // data block 攒够大小，切出并写盘。
@@ -160,7 +162,11 @@ impl TableBuilder {
 
     /// 完成 SSTable：flush 最后一个 data block、写 index、写 footer。
     pub fn finish(mut self) -> Result<()> {
-        assert!(!self.finished, "TableBuilder already finished");
+        if self.finished {
+            return Err(MulanError::Corrupted(
+                "TableBuilder already finished".into(),
+            ));
+        }
         self.finished = true;
 
         // 刷出最后的 data block。
@@ -176,12 +182,9 @@ impl TableBuilder {
             }
         }
 
-        // 构建 Bloom Filter 写入 filter block，再写 metaindex block。
-        // metaindex block 是一条 Block entry：(key="filter.mulan.BloomFilter", value=filter_handle)。
-        // 该间接层支持未来扩展多种 meta 数据，而无需改动 footer 结构。
-        let bloom_keys: Vec<&[u8]> = self.user_keys.iter().map(|v| v.as_slice()).collect();
-        let bloom = BloomFilter::from_keys(&bloom_keys, self.bits_per_key);
-        let filter_handle = self.write_raw(&bloom.finish())?;
+        // 在线布隆：add 时已逐条插入，此处直接序列化输出。
+        let bloom_bytes = std::mem::take(&mut self.bloom).finish();
+        let filter_handle = self.write_raw(&bloom_bytes)?;
         let mut metaindex_builder = BlockBuilder::new();
         let mut meta_value = Vec::new();
         filter_handle.encode(&mut meta_value);
@@ -303,7 +306,9 @@ impl TableReader {
             return Ok(None);
         };
         if user_key_of_internal_key(&found_key) == user_key {
-            Ok(Some((vtype_of_internal_key(&found_key), value)))
+            let vtype = vtype_of_internal_key(&found_key)
+                .ok_or_else(|| MulanError::Corrupted("invalid vtype in sstable".into()))?;
+            Ok(Some((vtype, value)))
         } else {
             Ok(None)
         }
@@ -971,7 +976,7 @@ mod tests {
         let footer = &data[data.len() - FOOTER_LEN..];
         // footer 布局: [metaindex_handle 变长] [index_handle 变长] [padding] [magic 8字节]
         let (metaindex_handle, n1) = BlockHandle::decode(footer).unwrap();
-        let (_index_handle, n2) = BlockHandle::decode(&footer[n1..]).unwrap();
+        let (_index_handle, _n2) = BlockHandle::decode(&footer[n1..]).unwrap();
         // 重写 index handle offset 为超大值（超出文件长度）
         let mut new_footer = Vec::new();
         metaindex_handle.encode(&mut new_footer);
@@ -981,7 +986,7 @@ mod tests {
         };
         bogus_handle.encode(&mut new_footer);
         // 补 padding + magic
-        let used = new_footer.len();
+        let _used = new_footer.len();
         new_footer.resize(FOOTER_LEN - 8, 0);
         new_footer.extend_from_slice(&footer[footer.len() - 8..]);
 

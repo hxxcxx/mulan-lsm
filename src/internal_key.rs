@@ -110,8 +110,8 @@ pub fn internal_key_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
         ord => return ord,
     }
     // 同 user_key：比 seq 降序。从 encode 末尾 9 字节解析 seq（小端）。
-    let a_seq = seq_of_internal_key(a);
-    let b_seq = seq_of_internal_key(b);
+    let a_seq = seq_of_internal_key(a).unwrap_or(0);
+    let b_seq = seq_of_internal_key(b).unwrap_or(0);
     a_seq.cmp(&b_seq).reverse()
 }
 
@@ -123,23 +123,23 @@ pub fn user_key_of_internal_key(bytes: &[u8]) -> &[u8] {
     &bytes[..bytes.len() - FOOTER_LEN]
 }
 
-/// 从 internal key 字节提取 seq（小端）。无 footer 时返回 0。
-pub fn seq_of_internal_key(bytes: &[u8]) -> u64 {
+/// 从 internal key 字节提取 seq（小端）。无 footer 时返回 None。
+pub fn seq_of_internal_key(bytes: &[u8]) -> Option<u64> {
     if bytes.len() < FOOTER_LEN {
-        return 0;
+        return None;
     }
     let start = bytes.len() - FOOTER_LEN;
-    let seq_bytes: [u8; SEQ_LEN] = bytes[start..start + SEQ_LEN].try_into().unwrap();
-    u64::from_le_bytes(seq_bytes)
+    let seq_bytes: [u8; SEQ_LEN] = bytes[start..start + SEQ_LEN].try_into().ok()?;
+    Some(u64::from_le_bytes(seq_bytes))
 }
 
-/// 从 internal key 字节提取 vtype。无 footer 或 type 字节非法时返回 `Put`（保守缺省）。
-pub fn vtype_of_internal_key(bytes: &[u8]) -> ValueType {
+/// 从 internal key 字节提取 vtype。无 footer 或 type 字节非法时返回 None。
+pub fn vtype_of_internal_key(bytes: &[u8]) -> Option<ValueType> {
     if bytes.len() < FOOTER_LEN {
-        return ValueType::Put;
+        return None;
     }
     let vtype_byte = bytes[bytes.len() - TYPE_LEN];
-    ValueType::from_u8(vtype_byte).unwrap_or(ValueType::Put)
+    ValueType::from_u8(vtype_byte)
 }
 
 /// 构造查询用的哨兵 internal key 字节：`user_key + MAX_SEQUENCE 小端 + Put`。
@@ -302,5 +302,35 @@ mod tests {
         for (a, b, desc) in cases {
             assert!(a < b, "{desc}: expected a < b but got {:?}", a.cmp(&b));
         }
+    }
+
+    /// 损坏数据不应静默降级：vtype 非法时返回 None 而非 Put。
+    #[test]
+    fn vtype_of_internal_key_rejects_corrupt() {
+        // 正常 Put / Delete
+        let put = InternalKey::new(b"k".to_vec(), 1, ValueType::Put).encode();
+        assert_eq!(vtype_of_internal_key(&put), Some(ValueType::Put));
+        let del = InternalKey::new(b"k".to_vec(), 1, ValueType::Delete).encode();
+        assert_eq!(vtype_of_internal_key(&del), Some(ValueType::Delete));
+
+        // 太短
+        assert_eq!(vtype_of_internal_key(b"short"), None);
+        assert_eq!(vtype_of_internal_key(b""), None);
+
+        // type 字节非法
+        let mut corrupt = put.clone();
+        *corrupt.last_mut().unwrap() = 99;
+        assert_eq!(vtype_of_internal_key(&corrupt), None);
+    }
+
+    /// 损坏数据不应静默降级：seq 无法提取时返回 None 而非 0。
+    #[test]
+    fn seq_of_internal_key_rejects_corrupt() {
+        let ik = InternalKey::new(b"k".to_vec(), 42, ValueType::Put).encode();
+        assert_eq!(seq_of_internal_key(&ik), Some(42));
+
+        // 太短
+        assert_eq!(seq_of_internal_key(b"short"), None);
+        assert_eq!(seq_of_internal_key(b""), None);
     }
 }

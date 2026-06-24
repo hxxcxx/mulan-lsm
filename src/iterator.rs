@@ -207,12 +207,16 @@ impl DBIter {
     fn advance(&mut self) {
         self.pending = None;
         while let Some((ik_bytes, value)) = self.inner.next() {
-            let seq = seq_of_internal_key(&ik_bytes);
+            let Some(seq) = seq_of_internal_key(&ik_bytes) else {
+                continue;
+            };
             // 快照过滤：seq > snapshot 的版本对当前快照不可见，跳过。
             if seq > self.snapshot_seq {
                 continue;
             }
-            let vtype = vtype_of_internal_key(&ik_bytes);
+            let Some(vtype) = vtype_of_internal_key(&ik_bytes) else {
+                continue;
+            };
             let user_key = user_key_of_internal_key(&ik_bytes).to_vec();
             // 跳过同 user_key 的后续版本（它们的 seq 更小 = 旧版本，对用户不可见）。
             while let Some((peek_key, _)) = self.inner.peek() {

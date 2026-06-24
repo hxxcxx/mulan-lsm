@@ -21,7 +21,7 @@ const TAG_COMPARATOR: u8 = 1;
 const TAG_LOG_NUMBER: u8 = 2;
 const TAG_NEXT_FILE_NUMBER: u8 = 3;
 const TAG_LAST_SEQUENCE: u8 = 4;
-// TAG_COMPACT_POINTER = 5：compaction 轮转起点，未实现 compaction 时不出现在 edit 中。
+const TAG_COMPACT_POINTER: u8 = 5;
 const TAG_DELETED_FILE: u8 = 6;
 const TAG_NEW_FILE: u8 = 7;
 // 8 曾用于 large value ref，已废弃。
@@ -40,6 +40,8 @@ pub struct VersionEdit {
     pub last_sequence: Option<u64>,
     pub deleted_files: Vec<DeletedFile>,
     pub new_files: Vec<NewFile>,
+    /// compaction 轮转起点：每项 (level, user_key)。持久化后重启不丢失进度。
+    pub compact_pointers: Vec<(u32, Vec<u8>)>,
 }
 
 /// "从某层删除某文件"的记录。
@@ -96,6 +98,11 @@ impl VersionEdit {
         self
     }
 
+    pub fn set_compact_pointer(&mut self, level: u32, key: Vec<u8>) -> &mut Self {
+        self.compact_pointers.push((level, key));
+        self
+    }
+
     /// 编码为字节。缺省字段不写出。
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -142,6 +149,12 @@ impl VersionEdit {
             let l = f.meta.largest.encode();
             encode_varint32(buf, l.len() as u32);
             buf.extend_from_slice(&l);
+        }
+        for (level, key) in &self.compact_pointers {
+            buf.push(TAG_COMPACT_POINTER);
+            encode_varint32(buf, *level);
+            encode_varint32(buf, key.len() as u32);
+            buf.extend_from_slice(key);
         }
     }
 
@@ -224,6 +237,19 @@ impl VersionEdit {
                         // allowed_seeks 不持久化，解码时初始化为 0。
                         meta: FileMetaData::new(FileNumber(num), size, smallest, largest),
                     });
+                }
+                TAG_COMPACT_POINTER => {
+                    let (level, n1) = decode_varint32(&buf[i..])?;
+                    i += n1;
+                    let (key_len, n2) = decode_varint32(&buf[i..])?;
+                    i += n2;
+                    let key_end = i + key_len as usize;
+                    if key_end > buf.len() {
+                        return Err(corrupt("compact pointer key out of bounds"));
+                    }
+                    edit.compact_pointers
+                        .push((level, buf[i..key_end].to_vec()));
+                    i = key_end;
                 }
                 _ => return Err(corrupt(format!("unknown version edit tag: {tag}"))),
             }
@@ -559,5 +585,19 @@ mod tests {
         assert!(recovered.edits.len() <= 2);
         // 第一条完整落盘的应能恢复。
         assert!(!recovered.edits.is_empty() || truncated == 0);
+    }
+
+    /// 验证 compact_pointer 在 VersionEdit 编解码中完整保留。
+    #[test]
+    fn compact_pointer_round_trip() {
+        let mut edit = VersionEdit::new();
+        edit.set_compact_pointer(1, b"foo".to_vec())
+            .set_compact_pointer(3, b"bar".to_vec())
+            .set_last_sequence(99);
+        let decoded = VersionEdit::decode(&edit.encode()).unwrap();
+        assert_eq!(decoded.compact_pointers.len(), 2);
+        assert_eq!(decoded.compact_pointers[0], (1, b"foo".to_vec()));
+        assert_eq!(decoded.compact_pointers[1], (3, b"bar".to_vec()));
+        assert_eq!(decoded.last_sequence, Some(99));
     }
 }

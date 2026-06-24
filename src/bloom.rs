@@ -4,6 +4,7 @@
 //! 特性：零假阴性（说不在我信），有假阳性（说在我不信，可能误判）。
 
 /// Bloom Filter。
+#[derive(Default)]
 pub struct BloomFilter {
     /// 位数组（以字节存储，bit 紧凑）。
     bits: Vec<u8>,
@@ -15,6 +16,7 @@ impl BloomFilter {
     /// 按 bits_per_key 创建空 filter，并据此确定 k。
     /// k = max(1, round(bits_per_key * ln(2)))，是给定 bits_per_key 下的最优哈希数。
     /// bits_per_key=10 → k=7。
+    /// 位数组为空，需调用 `ensure_capacity` 预分配或等 `from_keys` 批量构建。
     pub fn new(bits_per_key: usize) -> Self {
         let k = ((bits_per_key as f64) * std::f64::consts::LN_2)
             .round()
@@ -24,6 +26,14 @@ impl BloomFilter {
             bits: Vec::new(),
             k,
         }
+    }
+
+    /// 预分配位数组，面向 `num_keys` 个 key、每个 `bits_per_key` 位。
+    /// 在线插入前必须调用，否则 insert 因 bits 为空而无效。
+    pub fn ensure_capacity(&mut self, num_keys: usize, bits_per_key: usize) {
+        let total_bits = (num_keys * bits_per_key).max(64);
+        let total_bytes = total_bits.div_ceil(8);
+        self.bits = vec![0u8; total_bytes];
     }
 
     /// 用给定的 key 列表构造 filter（批量插入，按总 bits 预分配）。

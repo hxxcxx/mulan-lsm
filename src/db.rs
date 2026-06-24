@@ -508,13 +508,12 @@ fn run_one_compaction(
     for (lvl, num) in &output.deleted_files {
         edit.add_delete(*lvl as u32, *num);
     }
+    // compact_pointer 持久化：写入 edit 随 manifest 落盘，重启后恢复。
+    if let Some(last) = output.new_files.last() {
+        edit.set_compact_pointer(level as u32, last.largest.user_key.clone());
+    }
     edit.set_next_file_number(inner.id_gen.next_number());
     inner.version_set.write_new_version(&edit)?;
-    if let Some(last) = output.new_files.last() {
-        inner
-            .version_set
-            .set_compact_pointer(level, last.largest.user_key.clone());
-    }
     // 从缓存中移除被替换的旧文件（它们已不在 Version 中）。
     for (_, num) in &output.deleted_files {
         cache.evict(*num);

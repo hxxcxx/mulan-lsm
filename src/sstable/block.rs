@@ -47,8 +47,12 @@ impl BlockBuilder {
     }
 
     /// 追加一条 kv。调用方必须保证 key 严格大于上一条（有序）。
-    pub fn add(&mut self, key: &[u8], value: &[u8]) {
-        assert!(!self.finished, "BlockBuilder already finished");
+    pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        if self.finished {
+            return Err(MulanError::Corrupted(
+                "BlockBuilder already finished".into(),
+            ));
+        }
         // 计算与上一条 key 的共享前缀长度。
         // restart point 处强制 shared=0；否则取真实公共前缀。
         let shared = if self.count_since_restart < RESTART_INTERVAL {
@@ -70,6 +74,7 @@ impl BlockBuilder {
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
         self.count_since_restart += 1;
+        Ok(())
     }
 
     /// 输出 block 字节。输出后不可再 add。

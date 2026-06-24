@@ -254,7 +254,9 @@ pub fn do_compaction(
     let mut last_seq: u64 = 0;
 
     while let Some((ik_bytes, value)) = merger.next() {
-        let vtype = vtype_of_internal_key(&ik_bytes);
+        let Some(vtype) = vtype_of_internal_key(&ik_bytes) else {
+            continue;
+        };
         let user_key = user_key_of_internal_key(&ik_bytes);
         let ik = InternalKey::decode(&ik_bytes)?;
         let seq = ik.seq;

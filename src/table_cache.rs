@@ -52,13 +52,17 @@ impl TableCache {
     /// 缓存满时淘汰最久未用的条目。文件打开不在锁内进行，减少锁争用。
     /// 容量为 0 时不缓存（每次直接打开文件，不进缓存）。
     pub fn get(&self, number: FileNumber) -> Result<Arc<TableReader>> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         if inner.capacity == 0 {
             drop(inner);
             return Ok(Arc::new(TableReader::open(&sst_path(&self.dir, number))?));
         }
         if let Some(reader) = inner.entries.get(&number) {
-            return Ok(Arc::clone(reader));
+            let cloned = Arc::clone(reader);
+            // LRU：命中时将该条目移到队尾，避免热点被淘汰。
+            inner.order.retain(|n| *n != number);
+            inner.order.push_back(number);
+            return Ok(cloned);
         }
         let dir = self.dir.clone();
         drop(inner);
@@ -160,5 +164,25 @@ mod tests {
         let cache = TableCache::new(dir);
         let reader = cache.get(FileNumber(1)).unwrap();
         assert_eq!(reader.get(b"k").unwrap(), Some(b"v".as_slice()));
+    }
+
+    /// LRU：频繁访问的条目不应被淘汰。
+    #[test]
+    fn cache_lru_keeps_hot_entries() {
+        let dir = tmp_dir("lru");
+        for i in 1..=3 {
+            build_test_sst(&dir, FileNumber(i));
+        }
+        let cache = TableCache::with_capacity(dir, 2);
+        cache.get(FileNumber(1)).unwrap(); // 1 在队尾
+        cache.get(FileNumber(2)).unwrap(); // 2 在队尾，1 在队头
+        // 重新访问 1 → 1 移到队尾，2 变队头
+        cache.get(FileNumber(1)).unwrap();
+        // 插入 3 → 淘汰队头（2），1 因在队尾而存活
+        cache.get(FileNumber(3)).unwrap();
+        // 1 应在缓存中（同一 Arc）
+        let r1a = cache.get(FileNumber(1)).unwrap();
+        let r1b = cache.get(FileNumber(1)).unwrap();
+        assert!(Arc::ptr_eq(&r1a, &r1b), "hot entry should survive eviction");
     }
 }
