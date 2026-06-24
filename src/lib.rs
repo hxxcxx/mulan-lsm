@@ -14,6 +14,7 @@ pub mod sstable;
 pub mod varint;
 pub mod version;
 pub mod wal;
+pub mod table_cache;
 
 pub use db::{Db, Options};
 pub use error::{MulanError, Result};

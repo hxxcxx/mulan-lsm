@@ -15,6 +15,7 @@ use crate::internal_key::ValueType;
 use crate::manifest::{write_current, VersionEdit};
 use crate::memtable::{FlushResult, MemTable};
 use crate::sstable::TableReader;
+use crate::table_cache::TableCache;
 use crate::version::{Version, VersionSet, NUM_LEVELS};
 use crate::wal::{decode_entry, encode_entry, WalReader, WalWriter};
 use std::collections::HashSet;
@@ -53,6 +54,7 @@ struct DbInner {
 /// mulan-lsm 数据库主类。一个实例对应一个目录。
 pub struct Db {
     inner: Arc<(Mutex<DbInner>, Condvar)>,
+    table_cache: Arc<TableCache>,
     bg_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -97,13 +99,19 @@ impl Db {
             Self::create_new(dir, options)?
         };
         let inner = Arc::new((Mutex::new(db_inner), Condvar::new()));
+        let table_cache = Arc::new(TableCache::new(dir.to_path_buf()));
         let bg_thread = if auto_compact {
             let c = inner.clone();
-            Some(std::thread::spawn(move || background_compaction(c)))
+            let cache = table_cache.clone();
+            Some(std::thread::spawn(move || background_compaction(c, cache)))
         } else {
             None
         };
-        Ok(Db { inner, bg_thread })
+        Ok(Db {
+            inner,
+            table_cache,
+            bg_thread,
+        })
     }
 
     fn create_new(dir: &Path, options: Options) -> Result<DbInner> {
@@ -244,10 +252,10 @@ impl Db {
             None => {}
         }
         let version = inner.version_set.current();
-        let dir = inner.dir.clone();
         drop(inner);
+        // 先查 L0（最新文件优先），再查 L1+（二分定位）。
         for meta in version.files_at(0).iter().rev() {
-            let r = TableReader::open(&sst_path(&dir, meta.number))?;
+            let r = self.table_cache.get(meta.number)?;
             if let Some((vt, v)) = r.get_entry(key, snapshot) {
                 return Ok(match vt {
                     ValueType::Put => Some(v.to_vec()),
@@ -257,7 +265,7 @@ impl Db {
         }
         for level in 1..NUM_LEVELS {
             if let Some(meta) = find_file_for_key(version.files_at(level), key) {
-                let r = TableReader::open(&sst_path(&dir, meta.number))?;
+                let r = self.table_cache.get(meta.number)?;
                 if let Some((vt, v)) = r.get_entry(key, snapshot) {
                     return Ok(match vt {
                         ValueType::Put => Some(v.to_vec()),
@@ -281,10 +289,9 @@ impl Db {
             None => {}
         }
         let version = inner.version_set.current();
-        let dir = inner.dir.clone();
         drop(inner);
         for meta in version.files_at(0).iter().rev() {
-            let r = TableReader::open(&sst_path(&dir, meta.number))?;
+            let r = self.table_cache.get(meta.number)?;
             if let Some((vt, v)) = r.get_entry(key, snap_seq) {
                 return Ok(match vt {
                     ValueType::Put => Some(v.to_vec()),
@@ -294,7 +301,7 @@ impl Db {
         }
         for level in 1..NUM_LEVELS {
             if let Some(meta) = find_file_for_key(version.files_at(level), key) {
-                let r = TableReader::open(&sst_path(&dir, meta.number))?;
+                let r = self.table_cache.get(meta.number)?;
                 if let Some((vt, v)) = r.get_entry(key, snap_seq) {
                     return Ok(match vt {
                         ValueType::Put => Some(v.to_vec()),
@@ -376,7 +383,7 @@ impl Db {
     pub fn compact_once(&self) -> Result<bool> {
         let (lock, cvar) = &*self.inner;
         let mut inner = lock.lock().unwrap();
-        let did = run_one_compaction(&mut inner)?;
+        let did = run_one_compaction(&mut inner, &self.table_cache)?;
         drop(inner);
         cvar.notify_one();
         Ok(did)
@@ -444,7 +451,10 @@ fn maybe_schedule_compaction(inner: &mut DbInner) {
 }
 
 /// 执行一次 compaction：pick → 归并 → 提交。返回是否做了 compaction。
-fn run_one_compaction(inner: &mut std::sync::MutexGuard<'_, DbInner>) -> Result<bool> {
+fn run_one_compaction(
+    inner: &mut std::sync::MutexGuard<'_, DbInner>,
+    cache: &TableCache,
+) -> Result<bool> {
     let compaction = match pick_compaction(&inner.version_set) {
         Some(c) => c,
         None => return Ok(false),
@@ -470,6 +480,10 @@ fn run_one_compaction(inner: &mut std::sync::MutexGuard<'_, DbInner>) -> Result<
         inner
             .version_set
             .set_compact_pointer(level, last.largest.user_key.clone());
+    }
+    // 从缓存中移除被替换的旧文件（它们已不在 Version 中）。
+    for (_, num) in &output.deleted_files {
+        cache.evict(*num);
     }
     // 提交后清理被替换的旧 SSTable（孤儿），防磁盘空间膨胀。
     // 只清理 SSTable；WAL/manifest 由 open 路径处理（运行期它们可能正被使用）。
@@ -502,7 +516,7 @@ fn remove_obsolete_ssts(dir: &Path, version_set: &VersionSet) -> Result<()> {
     Ok(())
 }
 
-fn background_compaction(inner: Arc<(Mutex<DbInner>, Condvar)>) {
+fn background_compaction(inner: Arc<(Mutex<DbInner>, Condvar)>, cache: Arc<TableCache>) {
     let (lock, cvar) = &*inner;
     loop {
         let mut guard = lock.lock().unwrap();
@@ -515,7 +529,7 @@ fn background_compaction(inner: Arc<(Mutex<DbInner>, Condvar)>) {
         if guard.shutting_down {
             break;
         }
-        let _ = run_one_compaction(&mut guard);
+        let _ = run_one_compaction(&mut guard, &cache);
         guard.bg_compaction_scheduled = false;
         cvar.notify_all();
     }
