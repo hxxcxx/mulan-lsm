@@ -912,4 +912,89 @@ mod tests {
         }
         assert_eq!(count, 5000, "完整遍历必须吐出全部 5000 条");
     }
+
+    /// 损坏 SSTable（让 index block 的 num_restarts 超大数据）→ get_entry 返回 Err 而非 Ok(None)。
+    /// 这是 P0 修改的核心语义：数据损坏必须向上传播，不能静默当作"key 不存在"。
+    #[test]
+    fn corrupted_index_returns_error_not_none() {
+        let path = tmp_path("corrupt_idx.sst");
+        let entries = ordered_entries(30, 15);
+
+        let file = std::fs::File::create(&path).unwrap();
+        let mut builder = TableBuilder::new(file);
+        for (ik, value) in &entries {
+            builder.add(&ik.user_key, &ik.encode(), value).unwrap();
+        }
+        builder.finish().unwrap();
+
+        // 正常读：get_entry 返回 Ok(Some(...))
+        let reader = TableReader::open(&path).unwrap();
+        let first_key = &entries[0].0.user_key;
+        assert!(reader
+            .get_entry(first_key, crate::internal_key::MAX_SEQUENCE)
+            .unwrap()
+            .is_some());
+
+        // 损坏 index block 的 num_restarts：index block 紧贴 footer 之前，
+        // 其末尾 4 字节即 num_restarts。改写为超大值令 Block::new 拒绝。
+        let mut data = std::fs::read(&path).unwrap();
+        let num_restarts_offset = data.len() - FOOTER_LEN - 4;
+        // 写入 0x3FFF_FFFF → restarts_bytes = 4GB → 远超文件大小 → Block::new 返回 Err
+        data[num_restarts_offset..num_restarts_offset + 4]
+            .copy_from_slice(&0x3FFF_FFFFu32.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+
+        // 损坏后：get_entry 必须返回 Err
+        let reader = TableReader::open(&path).unwrap();
+        let result = reader.get_entry(first_key, crate::internal_key::MAX_SEQUENCE);
+        assert!(
+            result.is_err(),
+            "corrupted index block must produce Err, got {result:?}"
+        );
+    }
+
+    /// 损坏 SSTable（block handle 指向越界）→ get_entry 返回 Err。
+    #[test]
+    fn out_of_bounds_block_handle_returns_error() {
+        let path = tmp_path("corrupt_handle.sst");
+        let entries = ordered_entries(10, 5);
+
+        let file = std::fs::File::create(&path).unwrap();
+        let mut builder = TableBuilder::new(file);
+        for (ik, value) in &entries {
+            builder.add(&ik.user_key, &ik.encode(), value).unwrap();
+        }
+        builder.finish().unwrap();
+
+        // 读取并修改 index handle 的 offset 为超大的值
+        let mut data = std::fs::read(&path).unwrap();
+        let footer = &data[data.len() - FOOTER_LEN..];
+        // footer 布局: [metaindex_handle 变长] [index_handle 变长] [padding] [magic 8字节]
+        let (metaindex_handle, n1) = BlockHandle::decode(footer).unwrap();
+        let (_index_handle, n2) = BlockHandle::decode(&footer[n1..]).unwrap();
+        // 重写 index handle offset 为超大值（超出文件长度）
+        let mut new_footer = Vec::new();
+        metaindex_handle.encode(&mut new_footer);
+        let bogus_handle = BlockHandle {
+            offset: data.len() as u64 + 100_000,
+            size: 100,
+        };
+        bogus_handle.encode(&mut new_footer);
+        // 补 padding + magic
+        let used = new_footer.len();
+        new_footer.resize(FOOTER_LEN - 8, 0);
+        new_footer.extend_from_slice(&footer[footer.len() - 8..]);
+
+        let footer_start = data.len() - FOOTER_LEN;
+        data[footer_start..].copy_from_slice(&new_footer);
+
+        std::fs::write(&path, &data).unwrap();
+
+        let reader = TableReader::open(&path).unwrap();
+        let result = reader.get_entry(&entries[0].0.user_key, crate::internal_key::MAX_SEQUENCE);
+        assert!(
+            result.is_err(),
+            "out-of-bounds block handle must produce Err, got {result:?}"
+        );
+    }
 }

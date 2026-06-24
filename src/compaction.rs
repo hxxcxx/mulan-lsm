@@ -945,4 +945,47 @@ mod tests {
         }
         // 没有新文件也是正确的（全被丢弃）。
     }
+
+    /// 验证 do_compaction 使用传入的 block_target 参数（非硬编码默认值）。
+    /// 小 block_target → 输出 SSTable 的 data block 数更多。
+    #[test]
+    fn do_compaction_respects_block_target() {
+        let dir = tmp_compaction_dir("block_target");
+        // 1000 条 entry，足够在 256 字节 block_target 下产生多个 data block。
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..1000u32)
+            .map(|i| (format!("key{i:05}").into_bytes(), format!("v{i}").into_bytes()))
+            .collect();
+        let f1 = build_sst(&dir, FileNumber(1), 0, &entries);
+        let compaction = Compaction {
+            level: 0,
+            inputs: [vec![f1], vec![]],
+            grandparents: vec![],
+        };
+        let version = Version::empty();
+
+        // 极小 block_target (128 字节) → 大量 data block
+        let mut id_gen = IdGenerator::new(100);
+        let out_small = do_compaction(
+            &dir, &compaction, &version, &mut id_gen,
+            crate::internal_key::MAX_SEQUENCE, 128, 10,
+        ).unwrap();
+        let reader_small = TableReader::open(&sst_path(&dir, out_small.new_files[0].number)).unwrap();
+        let small_blocks = reader_small.into_table_iter().unwrap().blocks_loaded_capacity();
+
+        // 大 block_target (64KB) → 少量 data block
+        let mut id_gen2 = IdGenerator::new(200);
+        let out_large = do_compaction(
+            &dir, &compaction, &version, &mut id_gen2,
+            crate::internal_key::MAX_SEQUENCE, 64 * 1024, 10,
+        ).unwrap();
+        let reader_large = TableReader::open(&sst_path(&dir, out_large.new_files[0].number)).unwrap();
+        let large_blocks = reader_large.into_table_iter().unwrap().blocks_loaded_capacity();
+
+        assert!(
+            small_blocks > large_blocks,
+            "small block_target (128) produced {small_blocks} data blocks, \
+             large block_target (64KB) produced {large_blocks}; \
+             small should have more blocks"
+        );
+    }
 }
