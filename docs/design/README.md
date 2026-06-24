@@ -19,3 +19,4 @@
 | [Iterator](iterator.md) | MergingIterator 归并、DBIter 过滤 | `src/iterator.rs` |
 | [Compaction](compaction.md) | 触发、选文件、祖父控制、锁粒度 | `src/compaction.rs` |
 | [通用原则](principles.md) | 错误处理、边界测试、设计哲学 | — |
+| [已完成的优化](optimizations.md) | TableIter 惰性化、API 简化、bug 修复 | — |
