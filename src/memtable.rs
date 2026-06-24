@@ -21,6 +21,8 @@ pub struct MemTable {
     skiplist: SkipList<InternalKey, Vec<u8>>,
     seq: u64,
     entries: usize,
+    /// 近似内存占用（key + value 字节数），用于字节阈值 flush。
+    approx_bytes: usize,
 }
 
 impl MemTable {
@@ -29,6 +31,7 @@ impl MemTable {
             skiplist: SkipList::new(),
             seq: 0,
             entries: 0,
+            approx_bytes: 0,
         }
     }
 
@@ -38,6 +41,7 @@ impl MemTable {
             skiplist: SkipList::new(),
             seq,
             entries: 0,
+            approx_bytes: 0,
         }
     }
 
@@ -49,6 +53,11 @@ impl MemTable {
     /// 当前 memtable 中的条目数（含删除标记）。
     pub fn num_entries(&self) -> usize {
         self.entries
+    }
+
+    /// memtable 近似内存占用（字节），供字节阈值 flush 使用。
+    pub fn approx_bytes(&self) -> usize {
+        self.approx_bytes
     }
 
     /// 把 memtable 中 seq ≤ snapshot_seq 的全部 entry 收集成 Vec（按 Ord 有序）。
@@ -66,6 +75,7 @@ impl MemTable {
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         self.seq += 1;
         let ik = InternalKey::new(key.to_vec(), self.seq, ValueType::Put);
+        self.approx_bytes += key.len() + value.len();
         self.skiplist.insert(ik, value.to_vec());
         self.entries += 1;
     }
@@ -76,6 +86,7 @@ impl MemTable {
     pub fn delete(&mut self, key: &[u8]) {
         self.seq += 1;
         let ik = InternalKey::new(key.to_vec(), self.seq, ValueType::Delete);
+        self.approx_bytes += key.len();
         // 删除标记的 value 为空。
         self.skiplist.insert(ik, Vec::new());
         self.entries += 1;
@@ -87,6 +98,7 @@ impl MemTable {
     /// 同时把 seq 推进到 max(当前, record_seq)，保证后续写入继续递增。
     pub fn apply(&mut self, vtype: ValueType, seq: u64, key: &[u8], value: &[u8]) {
         let ik = InternalKey::new(key.to_vec(), seq, vtype);
+        self.approx_bytes += key.len() + value.len();
         self.skiplist.insert(ik, value.to_vec());
         if seq > self.seq {
             self.seq = seq;

@@ -10,7 +10,8 @@ use crate::internal_key::{
     internal_key_cmp, seq_of_internal_key, user_key_of_internal_key, vtype_of_internal_key,
 };
 use crate::internal_key::{InternalKey, ValueType};
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 
 /// LSM 内部有序迭代器：流式输出 (internal_key_bytes, value_bytes)。
 /// 实现者保证输出按 `internal_key_cmp` 严格升序。
@@ -37,96 +38,56 @@ impl Buffered {
     }
 }
 
+impl Ord for Buffered {
+    fn cmp(&self, other: &Self) -> Ordering {
+        internal_key_cmp(&self.key, &other.key)
+    }
+}
+
+impl PartialOrd for Buffered {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Buffered {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Buffered {}
+
 /// 多路归并迭代器。
 ///
-/// 堆顶是 `internal_key_cmp` 最小的条目——由 Ord 定义，同 user_key 下大 seq 在前，
-/// 故堆顶 = 当前 user_key 的最新版本。`next` 输出堆顶后，弹出所有同 user_key 的后续条目
-/// （去重），再推进各源迭代器重新入堆。
+/// 使用 `BinaryHeap<Reverse<Buffered>>` 实现最小堆：堆顶是 `internal_key_cmp` 最小的条目。
+/// 由 Ord 定义，同 user_key 下大 seq 在前，故堆顶 = 当前 user_key 的最新版本。
 pub struct MergingIterator {
     iters: Vec<Box<dyn LsmIterator>>,
-    /// 堆：按 `internal_key_cmp` 排序，最小在顶。用 Vec + 手动 sift 模拟二叉堆。
-    heap: Vec<Buffered>,
+    heap: BinaryHeap<Reverse<Buffered>>,
 }
 
 impl MergingIterator {
     pub fn new(iters: Vec<Box<dyn LsmIterator>>) -> Self {
         let mut merger = MergingIterator {
             iters,
-            heap: Vec::new(),
+            heap: BinaryHeap::new(),
         };
-        // 初始化：每个源 peek 一次入堆。
+        // 初始化：每个源取第一条入堆。
         for src in 0..merger.iters.len() {
             if let Some((k, v)) = merger.iters[src].next() {
-                merger.push(Buffered {
+                merger.heap.push(Reverse(Buffered {
                     key: k,
                     value: v,
                     src,
-                });
+                }));
             }
         }
         merger
     }
 
-    fn push(&mut self, item: Buffered) {
-        self.heap.push(item);
-        self.sift_up(self.heap.len() - 1);
-    }
-
-    fn pop(&mut self) -> Option<Buffered> {
-        if self.heap.is_empty() {
-            return None;
-        }
-        let last = self.heap.len() - 1;
-        self.heap.swap(0, last);
-        let item = self.heap.pop();
-        if !self.heap.is_empty() {
-            self.sift_down(0);
-        }
-        item
-    }
-
-    fn cmp_buffered(a: &Buffered, b: &Buffered) -> Ordering {
-        internal_key_cmp(&a.key, &b.key)
-    }
-
-    fn sift_up(&mut self, mut i: usize) {
-        while i > 0 {
-            let parent = (i - 1) / 2;
-            if Self::cmp_buffered(&self.heap[i], &self.heap[parent]) == Ordering::Less {
-                self.heap.swap(i, parent);
-                i = parent;
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn sift_down(&mut self, mut i: usize) {
-        let n = self.heap.len();
-        loop {
-            let mut smallest = i;
-            let left = 2 * i + 1;
-            let right = 2 * i + 2;
-            if left < n
-                && Self::cmp_buffered(&self.heap[left], &self.heap[smallest]) == Ordering::Less
-            {
-                smallest = left;
-            }
-            if right < n
-                && Self::cmp_buffered(&self.heap[right], &self.heap[smallest]) == Ordering::Less
-            {
-                smallest = right;
-            }
-            if smallest == i {
-                break;
-            }
-            self.heap.swap(i, smallest);
-            i = smallest;
-        }
-    }
-
     fn peek_top(&self) -> Option<(&[u8], &[u8])> {
-        self.heap.first().map(|b| b.peek())
+        self.heap.peek().map(|b| b.0.peek())
     }
 }
 
@@ -136,19 +97,16 @@ impl LsmIterator for MergingIterator {
     }
 
     fn next(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-        let top = self.pop()?;
-        let result = (top.key.clone(), top.value.clone());
+        let top = self.heap.pop()?;
+        let result = (top.0.key.clone(), top.0.value.clone());
         // 推进产出 top 的源迭代器，重新入堆。
-        if let Some((k, v)) = self.iters[top.src].next() {
-            self.push(Buffered {
+        if let Some((k, v)) = self.iters[top.0.src].next() {
+            self.heap.push(Reverse(Buffered {
                 key: k,
                 value: v,
-                src: top.src,
-            });
+                src: top.0.src,
+            }));
         }
-        // 不做"同 user_key 去重"——输出全部 internal key（按 internal_key_cmp 有序）。
-        // 同 user_key 的多版本按 seq 降序连续输出（大 seq 在前）。
-        // 去重/丢弃责任上移到调用方：DBIter 取每 user_key 最新、compaction 按 oldest_snapshot_seq 判定。
         Some(result)
     }
 }

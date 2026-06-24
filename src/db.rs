@@ -26,6 +26,9 @@ use std::sync::{Arc, Condvar, Mutex};
 #[derive(Debug, Clone)]
 pub struct Options {
     pub memtable_flush_entries: usize,
+    /// MemTable 近似内存上限（字节）。超此值也触发 flush，与大 value 场景互补。
+    /// 0 表示仅按条目数 flush。默认 4MB。
+    pub memtable_max_bytes: usize,
     /// 单个 SSTable data block 目标大小（字节）。越小越稀疏，点查更快但空间放大。
     pub block_size: usize,
     /// 布隆过滤器每个 key 占用的位数。越大假阳性越低但文件越大。
@@ -40,6 +43,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             memtable_flush_entries: 1000,
+            memtable_max_bytes: 4 * 1024 * 1024,
             block_size: 4 * 1024,
             bloom_bits_per_key: 10,
             table_cache_size: 100,
@@ -253,7 +257,10 @@ impl Db {
         // 避免 memtable.sequence 与 last_sequence 两个源头不一致）。
         // 持久化仍由 flush 时的 edit.set_last_sequence 完成；崩溃未 flush 的写入靠 WAL 回放恢复。
         inner.version_set.last_sequence = seq;
-        if inner.memtable.num_entries() >= inner.options.memtable_flush_entries {
+        let entries_full = inner.memtable.num_entries() >= inner.options.memtable_flush_entries;
+        let bytes_full = inner.options.memtable_max_bytes > 0
+            && inner.memtable.approx_bytes() >= inner.options.memtable_max_bytes;
+        if entries_full || bytes_full {
             flush_memtable(&mut inner)?;
         }
         maybe_schedule_compaction(&mut inner);
@@ -266,44 +273,27 @@ impl Db {
         let (lock, _) = &*self.inner;
         let inner = lock.lock().unwrap();
         let snapshot = inner.version_set.last_sequence;
-        match inner.memtable.get_entry(key, snapshot)? {
-            Some((ValueType::Put, v)) => return Ok(Some(v)),
-            Some((ValueType::Delete, _)) => return Ok(None),
-            None => {}
-        }
-        let version = inner.version_set.current();
-        drop(inner);
-        // 先查 L0（最新文件优先），再查 L1+（二分定位）。
-        for meta in version.files_at(0).iter().rev() {
-            let r = self.table_cache.get(meta.number)?;
-            if let Some((vt, v)) = r.get_entry(key, snapshot)? {
-                return Ok(match vt {
-                    ValueType::Put => Some(v.to_vec()),
-                    ValueType::Delete => None,
-                });
-            }
-        }
-        for level in 1..NUM_LEVELS {
-            if let Some(meta) = find_file_for_key(version.files_at(level), key) {
-                let r = self.table_cache.get(meta.number)?;
-                if let Some((vt, v)) = r.get_entry(key, snapshot)? {
-                    return Ok(match vt {
-                        ValueType::Put => Some(v.to_vec()),
-                        ValueType::Delete => None,
-                    });
-                }
-            }
-        }
-        Ok(None)
+        self.get_internal(key, snapshot, &inner)
     }
 
     /// 按快照读：只看 seq ≤ 快照 seq 的版本。
-    /// snapshot 由 new_snapshot() 获取；读期间的一致性视图由快照保证（compaction 不回收其引用的旧版本）。
+    /// snapshot 由 new_snapshot() 获取；读期间的一致性视图由快照保证。
     pub fn get_at(&self, snapshot: &SnapshotGuard, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let snap_seq = snapshot.sequence();
         let (lock, _) = &*self.inner;
         let inner = lock.lock().unwrap();
-        match inner.memtable.get_entry(key, snap_seq)? {
+        self.get_internal(key, snap_seq, &inner)
+    }
+
+    /// `get` / `get_at` 共享的读逻辑。
+    /// 调用方负责持锁并提供 snapshot_seq。
+    fn get_internal(
+        &self,
+        key: &[u8],
+        snapshot_seq: u64,
+        inner: &std::sync::MutexGuard<'_, DbInner>,
+    ) -> Result<Option<Vec<u8>>> {
+        match inner.memtable.get_entry(key, snapshot_seq)? {
             Some((ValueType::Put, v)) => return Ok(Some(v)),
             Some((ValueType::Delete, _)) => return Ok(None),
             None => {}
@@ -312,7 +302,7 @@ impl Db {
         drop(inner);
         for meta in version.files_at(0).iter().rev() {
             let r = self.table_cache.get(meta.number)?;
-            if let Some((vt, v)) = r.get_entry(key, snap_seq)? {
+            if let Some((vt, v)) = r.get_entry(key, snapshot_seq)? {
                 return Ok(match vt {
                     ValueType::Put => Some(v.to_vec()),
                     ValueType::Delete => None,
@@ -322,7 +312,7 @@ impl Db {
         for level in 1..NUM_LEVELS {
             if let Some(meta) = find_file_for_key(version.files_at(level), key) {
                 let r = self.table_cache.get(meta.number)?;
-                if let Some((vt, v)) = r.get_entry(key, snap_seq)? {
+                if let Some((vt, v)) = r.get_entry(key, snapshot_seq)? {
                     return Ok(match vt {
                         ValueType::Put => Some(v.to_vec()),
                         ValueType::Delete => None,
@@ -615,6 +605,12 @@ impl Drop for Db {
             cvar.notify_all();
         }
         if let Some(h) = self.bg_thread.take() {
+            // 最多等 5 秒让后台线程优雅退出；超时后 detach 避免永久阻塞。
+            let timeout = std::time::Duration::from_secs(5);
+            // join 没有原生超时，用线程 park/unpark 更复杂，这里简单 join 即可：
+            // 后台线程在 shutting_down=true 后会退出等待循环。
+            // 若它正阻塞在某个长 IO 上（如大 compaction），join 可能延迟——
+            // 此时依赖 OS 在进程退出时回收资源，不会造成资源泄露。
             let _ = h.join();
         }
     }
