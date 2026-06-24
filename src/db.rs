@@ -490,7 +490,6 @@ fn run_one_compaction(
         block_target,
         bits_per_key,
     )?;
-    inner.id_gen.bump_to(id_gen.next_number());
     let mut edit = VersionEdit::new();
     for f in &output.new_files {
         edit.add_file((level + 1) as u32, f.clone());
@@ -502,8 +501,10 @@ fn run_one_compaction(
     if let Some(last) = output.new_files.last() {
         edit.set_compact_pointer(level as u32, last.largest.user_key.clone());
     }
-    edit.set_next_file_number(inner.id_gen.next_number());
+    edit.set_next_file_number(id_gen.next_number());
     inner.version_set.write_new_version(&edit)?;
+    // write_new_version 成功后才推进 inner.id_gen：若提交失败，编号不泄露。
+    inner.id_gen.bump_to(id_gen.next_number());
     // 从缓存中移除被替换的旧文件（它们已不在 Version 中）。
     for (_, num) in &output.deleted_files {
         cache.evict(*num);

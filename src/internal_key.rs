@@ -105,9 +105,8 @@ impl Eq for InternalKey {}
 pub fn internal_key_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     let a_uk = user_key_of_internal_key(a);
     let b_uk = user_key_of_internal_key(b);
-    match a_uk.cmp(b_uk) {
-        std::cmp::Ordering::Equal => {}
-        ord => return ord,
+    if a_uk != b_uk {
+        return a_uk.cmp(b_uk);
     }
     // 同 user_key：比 seq 降序。从 encode 末尾 9 字节解析 seq（小端）。
     let a_seq = seq_of_internal_key(a).unwrap_or(0);
