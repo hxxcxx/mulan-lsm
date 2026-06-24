@@ -145,6 +145,10 @@ impl Db {
                 let e = decode_entry(&rec)?;
                 memtable.apply(e.vtype, e.seq, &e.key, &e.value);
             }
+            // WAL 回放后推进 last_sequence 到 memtable 的最新 seq，保持单一权威源一致。
+            if memtable.sequence() > version_set.last_sequence {
+                version_set.last_sequence = memtable.sequence();
+            }
         }
         let wal_number;
         if memtable.num_entries() > 0 {
@@ -214,6 +218,10 @@ impl Db {
             ValueType::Delete => inner.memtable.delete(key),
         }
         let seq = inner.memtable.sequence();
+        // write 立即推进 last_sequence，使其成为 seq 的唯一权威源（快照直接取它，
+        // 避免 memtable.sequence 与 last_sequence 两个源头不一致）。
+        // 持久化仍由 flush 时的 edit.set_last_sequence 完成；崩溃未 flush 的写入靠 WAL 回放恢复。
+        inner.version_set.last_sequence = seq;
         inner
             .wal
             .add_record(&encode_entry(vtype, seq, key, value))?;
@@ -268,17 +276,14 @@ impl Db {
         self.inner.0.lock().unwrap().version_set.current()
     }
 
-    /// 获取一致性快照：固定当前最新已分配的 seq 作为读时间点。
-    /// seq 取自 MemTable（每次写入递增），而非 VersionSet.last_sequence（只在 flush 时同步）——
-    /// 这样快照能看到 memtable 中尚未 flush 的写入。
-    /// 返回的 SnapshotGuard drop 时自动释放。快照存在期间，compaction 不会回收
-    /// seq > 快照 seq 的旧版本，保证快照读到的一致性视图稳定。
+    /// 获取一致性快照：固定当前 last_sequence 作为读时间点。
+    /// last_sequence 是 seq 的唯一权威源（write 时立即推进），故快照能看到所有已提交写入
+    /// （含 memtable 中尚未 flush 的）。返回的 SnapshotGuard drop 时自动释放。
+    /// 快照存在期间，compaction 不会回收 seq > 快照 seq 的旧版本，保证一致性视图稳定。
     pub fn new_snapshot(&self) -> SnapshotGuard {
         let (lock, _) = &*self.inner;
         let mut inner = lock.lock().unwrap();
-        // seq 取自 MemTable（每次写入递增），而非 VersionSet.last_sequence（只在 flush 时同步）——
-        // 这样快照能看到 memtable 中尚未 flush 的写入。
-        let seq = inner.memtable.sequence();
+        let seq = inner.version_set.last_sequence;
         inner.version_set.acquire_snapshot(seq);
         SnapshotGuard {
             seq,
