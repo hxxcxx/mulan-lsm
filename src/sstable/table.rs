@@ -269,16 +269,17 @@ impl TableReader {
 
     /// 按 user_key 查找最新版本的 (vtype, value)。命中时返回两者；未命中返回 None。
     /// 流程：布隆过滤 → 哨兵 internal key → index 定位 data block → block 内 lower_bound → 校验 user_key。
-    pub fn get_entry(&self, user_key: &[u8]) -> Option<(ValueType, &[u8])> {
+    /// 按 user_key 查找 snapshot_seq 时间点的版本。
+    /// 流程：布隆过滤 → 哨兵 internal key(seq=snapshot) → index 定位 data block → block 内 lower_bound → 校验 user_key。
+    pub fn get_entry(&self, user_key: &[u8], snapshot_seq: u64) -> Option<(ValueType, &[u8])> {
         // 布隆过滤：user_key 肯定不在则直接返回 None，省掉读 data block。
         if let Some(bloom) = &self.bloom {
             if !bloom.may_contain(user_key) {
                 return None;
             }
         }
-        // 构造哨兵 internal key：user_key + MAX_SEQUENCE。同 user_key 下 Ord 最小（排最前），
-        // lower_bound 命中的第一个 >= 哨兵的 entry 即最新版本。
-        let lookup = lookup_key(user_key);
+        // 哨兵：user_key + snapshot_seq。同 user_key 下命中的第一个 ≥ 哨兵的 entry 即 ≤ snapshot 的最新版本。
+        let lookup = lookup_key(user_key, snapshot_seq);
         // index lower_bound 定位 data block（用 internal_key_cmp 比较）。
         let index_bytes = self.block_bytes(&self.index_handle).ok()?;
         let index_block = Block::new(index_bytes).ok()?;
@@ -298,7 +299,7 @@ impl TableReader {
 
     /// 按 user_key 查找最新版本。删除标记视为不存在（返回 None）。
     pub fn get(&self, user_key: &[u8]) -> Option<&[u8]> {
-        match self.get_entry(user_key)? {
+        match self.get_entry(user_key, crate::internal_key::MAX_SEQUENCE)? {
             (ValueType::Put, value) => Some(value),
             (ValueType::Delete, _) => None,
         }
@@ -609,7 +610,9 @@ mod tests {
         // get_entry 暴露 (Delete, 空) 以证明标记确实被存储。
         assert_eq!(reader.get(b"k1"), None);
         assert_eq!(
-            reader.get_entry(b"k1").map(|(t, v)| (t, v.len())),
+            reader
+                .get_entry(b"k1", crate::internal_key::MAX_SEQUENCE)
+                .map(|(t, v)| (t, v.len())),
             Some((ValueType::Delete, 0))
         );
         // k2 最新是 Put v2。
@@ -713,7 +716,9 @@ mod tests {
         // key2 最新是删除标记：get 返回 None，get_entry 暴露 (Delete, 空)。
         assert_eq!(reader.get(b"key2"), None);
         assert_eq!(
-            reader.get_entry(b"key2").map(|(t, v)| (t, v.len())),
+            reader
+                .get_entry(b"key2", crate::internal_key::MAX_SEQUENCE)
+                .map(|(t, v)| (t, v.len())),
             Some((ValueType::Delete, 0))
         );
         // key3 正常。

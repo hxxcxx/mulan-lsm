@@ -124,7 +124,7 @@ pub fn user_key_of_internal_key(bytes: &[u8]) -> &[u8] {
 }
 
 /// 从 internal key 字节提取 seq（小端）。无 footer 时返回 0。
-fn seq_of_internal_key(bytes: &[u8]) -> u64 {
+pub fn seq_of_internal_key(bytes: &[u8]) -> u64 {
     if bytes.len() < FOOTER_LEN {
         return 0;
     }
@@ -150,8 +150,13 @@ pub fn vtype_of_internal_key(bytes: &[u8]) -> ValueType {
 /// 哨兵 seq=MAX 是最大的，在同 user_key 下 Ord 最小（排最前）。
 /// lower_bound(哨兵) 找第一个 Ord >= 哨兵的 → 同 user_key 的所有真实版本都 Ord > 哨兵（seq 更小 → Ord 更大），
 /// 故命中的是 Ord 最小的真实版本 = seq 最大的最新版本 ✓。
-pub fn lookup_key(user_key: &[u8]) -> Vec<u8> {
-    InternalKey::new(user_key.to_vec(), MAX_SEQUENCE, ValueType::Put).encode()
+/// 构造查询用的哨兵 internal key 字节：`user_key + seq 小端 + Put`。
+///
+/// seq 是可见性上界：lower_bound(lookup) 命中的第一个 ≥ 哨兵的 entry，
+/// 就是同 user_key 下 seq ≤ 此值 的最新版本（同 user_key seq 降序排列）。
+/// 传 MAX_SEQUENCE = 读最新版本；传快照 seq = 读快照时间点的版本。
+pub fn lookup_key(user_key: &[u8], seq: u64) -> Vec<u8> {
+    InternalKey::new(user_key.to_vec(), seq, ValueType::Put).encode()
 }
 
 impl Default for InternalKey {

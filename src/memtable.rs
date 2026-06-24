@@ -51,6 +51,17 @@ impl MemTable {
         self.entries
     }
 
+    /// 把 memtable 中 seq ≤ snapshot_seq 的全部 entry 收集成 Vec（按 Ord 有序）。
+    /// 供 DBIter 扫描用——memtable 借用生命周期无法跨锁存活，故全量克隆。
+    /// memtable 通常小（几 MB），克隆开销可接受。
+    pub fn snapshot_entries(&self, snapshot_seq: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.skiplist
+            .iter()
+            .filter(|(ik, _)| ik.seq <= snapshot_seq)
+            .map(|(ik, v)| (ik.encode(), v.clone()))
+            .collect()
+    }
+
     /// 写入一个键值对。每次写都分配一个新的 seq，作为独立版本插入跳表。
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         self.seq += 1;
@@ -116,14 +127,15 @@ impl MemTable {
     /// 多层 LSM 的读路径必须区分这两种情况：删除标记要屏蔽下层 SSTable 的旧版本，
     /// 而"未找到"才需要继续查下层。返回 `None` 表示 memtable 无此 user_key；
     /// `Some((Delete, _))` 表示找到删除标记；`Some((Put, v))` 表示找到有效值。
-    pub fn get_entry(&self, key: &[u8]) -> Result<Option<(ValueType, Vec<u8>)>> {
-        let lookup = InternalKey::new(key.to_vec(), MAX_SEQUENCE, ValueType::Put);
+    /// 读取 key 在 snapshot_seq 时间点的版本。
+    /// 哨兵用 (key, snapshot_seq)：lower_bound 命中同 user_key 下 seq ≤ snapshot 的最新版本。
+    /// 传 MAX_SEQUENCE = 读最新版本。
+    pub fn get_entry(&self, key: &[u8], snapshot_seq: u64) -> Result<Option<(ValueType, Vec<u8>)>> {
+        let lookup = InternalKey::new(key.to_vec(), snapshot_seq, ValueType::Put);
         let Some((ik, value)) = self.skiplist.lower_bound(&lookup) else {
-            // 跳表里没有任何 >= 哨兵的条目，key 从未写过。
             return Ok(None);
         };
         if ik.user_key != key {
-            // 第一个 >= 哨兵的条目属于别的 user_key，本 key 未写过。
             return Ok(None);
         }
         Ok(Some((ik.vtype, value.clone())))
@@ -132,7 +144,7 @@ impl MemTable {
     /// 读取 key 的最新版本。删除标记和未找到都返回 `None`（单层语义）。
     /// 多层读路径应改用 [`get_entry`](Self::get_entry) 以区分两者。
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.get_entry(key)? {
+        match self.get_entry(key, MAX_SEQUENCE)? {
             Some((ValueType::Put, v)) => Ok(Some(v)),
             _ => Ok(None),
         }

@@ -655,7 +655,7 @@ mod tests {
         );
 
         // lower_bound 查 present-2：哨兵 seq=MAX，应命中 present-2 的真实版本（而非 present-200）。
-        let lookup = lookup_key(b"present-2");
+        let lookup = lookup_key(b"present-2", crate::internal_key::MAX_SEQUENCE);
         let (found_key, _v) = block
             .lower_bound_kv(&lookup, &|a, b| internal_key_cmp(a, b))
             .expect("lower_bound should hit something");
@@ -694,7 +694,7 @@ mod tests {
         // 用 lookup_key 构造哨兵，测 lower_bound（返回 value）。
         // index 场景里 value 是 BlockHandle；这里 value 是 b"v"，但逻辑一样。
         for ik in &iks {
-            let lookup = lookup_key(&ik.user_key);
+            let lookup = lookup_key(&ik.user_key, crate::internal_key::MAX_SEQUENCE);
             let found = block.lower_bound(&lookup, &|a, b| internal_key_cmp(a, b));
             assert_eq!(
                 found,

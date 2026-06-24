@@ -237,7 +237,8 @@ impl Db {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let (lock, _) = &*self.inner;
         let inner = lock.lock().unwrap();
-        match inner.memtable.get_entry(key)? {
+        let snapshot = inner.version_set.last_sequence;
+        match inner.memtable.get_entry(key, snapshot)? {
             Some((ValueType::Put, v)) => return Ok(Some(v)),
             Some((ValueType::Delete, _)) => return Ok(None),
             None => {}
@@ -247,7 +248,7 @@ impl Db {
         drop(inner);
         for meta in version.files_at(0).iter().rev() {
             let r = TableReader::open(&sst_path(&dir, meta.number))?;
-            if let Some((vt, v)) = r.get_entry(key) {
+            if let Some((vt, v)) = r.get_entry(key, snapshot) {
                 return Ok(match vt {
                     ValueType::Put => Some(v.to_vec()),
                     ValueType::Delete => None,
@@ -257,7 +258,7 @@ impl Db {
         for level in 1..NUM_LEVELS {
             if let Some(meta) = find_file_for_key(version.files_at(level), key) {
                 let r = TableReader::open(&sst_path(&dir, meta.number))?;
-                if let Some((vt, v)) = r.get_entry(key) {
+                if let Some((vt, v)) = r.get_entry(key, snapshot) {
                     return Ok(match vt {
                         ValueType::Put => Some(v.to_vec()),
                         ValueType::Delete => None,
@@ -266,6 +267,78 @@ impl Db {
             }
         }
         Ok(None)
+    }
+
+    /// 按快照读：只看 seq ≤ 快照 seq 的版本。
+    /// snapshot 由 new_snapshot() 获取；读期间的一致性视图由快照保证（compaction 不回收其引用的旧版本）。
+    pub fn get_at(&self, snapshot: &SnapshotGuard, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let snap_seq = snapshot.sequence();
+        let (lock, _) = &*self.inner;
+        let inner = lock.lock().unwrap();
+        match inner.memtable.get_entry(key, snap_seq)? {
+            Some((ValueType::Put, v)) => return Ok(Some(v)),
+            Some((ValueType::Delete, _)) => return Ok(None),
+            None => {}
+        }
+        let version = inner.version_set.current();
+        let dir = inner.dir.clone();
+        drop(inner);
+        for meta in version.files_at(0).iter().rev() {
+            let r = TableReader::open(&sst_path(&dir, meta.number))?;
+            if let Some((vt, v)) = r.get_entry(key, snap_seq) {
+                return Ok(match vt {
+                    ValueType::Put => Some(v.to_vec()),
+                    ValueType::Delete => None,
+                });
+            }
+        }
+        for level in 1..NUM_LEVELS {
+            if let Some(meta) = find_file_for_key(version.files_at(level), key) {
+                let r = TableReader::open(&sst_path(&dir, meta.number))?;
+                if let Some((vt, v)) = r.get_entry(key, snap_seq) {
+                    return Ok(match vt {
+                        ValueType::Put => Some(v.to_vec()),
+                        ValueType::Delete => None,
+                    });
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// 创建范围扫描迭代器（当前最新快照）。
+    /// 返回 (SnapshotGuard, DBIter)：调用方须持有 guard 直到迭代结束，
+    /// 否则快照提前释放会导致 compaction 回收正在读的旧版本。
+    pub fn new_iterator(&self) -> Result<(SnapshotGuard, crate::iterator::DBIter)> {
+        let snap = self.new_snapshot();
+        let iter = self.new_iterator_at(&snap)?;
+        Ok((snap, iter))
+    }
+
+    /// 按指定快照创建范围扫描迭代器。
+    pub fn new_iterator_at(&self, snapshot: &SnapshotGuard) -> Result<crate::iterator::DBIter> {
+        use crate::iterator::{DBIter, LsmIterator, MergingIterator, VecIterator};
+        let snap_seq = snapshot.sequence();
+        let (lock, _) = &*self.inner;
+        let inner = lock.lock().unwrap();
+        let mut iters: Vec<Box<dyn LsmIterator>> = Vec::new();
+        // MemTable：全量克隆（借用无法跨锁），过滤 seq ≤ snap_seq。
+        let mem_items = inner.memtable.snapshot_entries(snap_seq);
+        if !mem_items.is_empty() {
+            iters.push(Box::new(VecIterator::new(mem_items)));
+        }
+        let version = inner.version_set.current();
+        let dir = inner.dir.clone();
+        drop(inner);
+        // 各层 SSTable：用 TableIter（惰性，自持 data）。
+        for level in 0..NUM_LEVELS {
+            for meta in version.files_at(level) {
+                let reader = TableReader::open(&sst_path(&dir, meta.number))?;
+                iters.push(Box::new(reader.into_table_iter()?));
+            }
+        }
+        let merger = MergingIterator::new(iters);
+        Ok(DBIter::new(merger, snap_seq))
     }
 
     pub fn wal_number(&self) -> FileNumber {
@@ -975,5 +1048,95 @@ mod tests {
         db.put(b"c", b"3").unwrap();
         let s2 = db.new_snapshot();
         assert!(s2.sequence() > s1.sequence(), "新快照 seq 应更大");
+    }
+
+    #[test]
+    fn snapshot_get_isolates_later_writes() {
+        // 取快照后写入新值：get_at 读到旧值，get 读到新值。
+        let dir = tmp_dir("snap-get");
+        let db = Db::open(&dir, small_options()).unwrap();
+        db.put(b"k", b"v1").unwrap();
+        let snap = db.new_snapshot();
+        db.put(b"k", b"v2").unwrap();
+        // 快照读：v1（快照时间点的值）。
+        assert_eq!(db.get_at(&snap, b"k").unwrap(), Some(b"v1".to_vec()));
+        // 最新读：v2。
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn snapshot_get_sees_delete_correctly() {
+        // 快照后删除：get_at 读到旧值，get 返回 None。
+        let dir = tmp_dir("snap-del");
+        let db = Db::open(&dir, small_options()).unwrap();
+        db.put(b"k", b"v").unwrap();
+        let snap = db.new_snapshot();
+        db.delete(b"k").unwrap();
+        assert_eq!(db.get_at(&snap, b"k").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(db.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn scan_returns_all_keys_ordered() {
+        // 范围扫描返回全部 key，按 user_key 升序。
+        let dir = tmp_dir("scan");
+        let db = Db::open(&dir, small_options()).unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        let (_snap, mut iter) = db.new_iterator().unwrap();
+        let out: Vec<(Vec<u8>, Vec<u8>)> = std::iter::from_fn(|| iter.next()).collect();
+        assert_eq!(
+            out.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+        assert_eq!(out[1].1, b"2");
+    }
+
+    #[test]
+    fn scan_skips_deleted_keys() {
+        let dir = tmp_dir("scan-del");
+        let db = Db::open(&dir, small_options()).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.delete(b"b").unwrap();
+        db.put(b"c", b"3").unwrap();
+        let (_snap, mut iter) = db.new_iterator().unwrap();
+        let keys: Vec<Vec<u8>> = std::iter::from_fn(|| iter.next()).map(|(k, _)| k).collect();
+        // b 被删除，不输出。
+        assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
+    }
+
+    #[test]
+    fn snapshot_scan_isolates_later_writes() {
+        // 取快照后写入新 key，scan 只看到快照前的。
+        let dir = tmp_dir("snap-scan");
+        let db = Db::open(&dir, small_options()).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        let snap = db.new_snapshot();
+        db.put(b"c", b"3").unwrap(); // 快照之后写入
+        let mut iter = db.new_iterator_at(&snap).unwrap();
+        let collected: Vec<Vec<u8>> = std::iter::from_fn(|| iter.next()).map(|(k, _)| k).collect();
+        // 只看到 a, b（快照前），c 不可见。
+        assert_eq!(collected, vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[test]
+    fn scan_across_flushed_sstable() {
+        // 写入触发 flush 后，scan 仍能扫到落盘的数据。
+        let dir = tmp_dir("scan-flush");
+        let db = Db::open(&dir, small_options()).unwrap();
+        for i in 0..6 {
+            db.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes())
+                .unwrap();
+        }
+        // memtable_flush_entries=5，第 6 条触发 flush，k0..k4 落 SSTable。
+        let (_snap, mut iter) = db.new_iterator().unwrap();
+        let out: Vec<(Vec<u8>, Vec<u8>)> = std::iter::from_fn(|| iter.next()).collect();
+        // 全部 6 个 key（跨 memtable + SSTable）。
+        assert_eq!(out.len(), 6);
+        assert_eq!(out[0].0, b"k0");
+        assert_eq!(out[5].0, b"k5");
     }
 }

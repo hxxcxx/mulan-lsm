@@ -6,7 +6,9 @@
 //! - `DBIter`：包装 `MergingIterator`，把 internal key 转成 user key + 跳过删除标记，
 //!   供用户层 range scan 用（M6）。
 
-use crate::internal_key::{internal_key_cmp, user_key_of_internal_key, vtype_of_internal_key};
+use crate::internal_key::{
+    internal_key_cmp, seq_of_internal_key, user_key_of_internal_key, vtype_of_internal_key,
+};
 use crate::internal_key::{InternalKey, ValueType};
 use std::cmp::Ordering;
 
@@ -184,27 +186,32 @@ impl LsmIterator for VecIterator {
 /// - `Delete` → 跳过（用户视角该 key 不存在）
 pub struct DBIter {
     inner: MergingIterator,
+    /// 快照 seq：只输出 seq ≤ 此值的版本。MAX_SEQUENCE = 读最新。
+    snapshot_seq: u64,
     /// 预读的下一条（user_key, value），供 peek。None 表示耗尽或下一条是 Delete 被跳过。
     pending: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl DBIter {
-    pub fn new(inner: MergingIterator) -> Self {
+    pub fn new(inner: MergingIterator, snapshot_seq: u64) -> Self {
         let mut iter = DBIter {
             inner,
+            snapshot_seq,
             pending: None,
         };
         iter.advance();
         iter
     }
 
-    /// 推进内部迭代器，跳过删除标记和同 user_key 的旧版本，把下一个有效 Put 存进 pending。
-    ///
-    /// MergingIterator 不去重，输出全部版本（同 user_key 大 seq 在前）。advance 取每个
-    /// user_key 的第一条（最新版本）：若是 Put 存起来、若是 Delete 跳过该 user_key 全部。
+    /// 推进内部迭代器，按 snapshot_seq 过滤 + 每 user_key 取最新 + 跳 Delete，存入 pending。
     fn advance(&mut self) {
         self.pending = None;
         while let Some((ik_bytes, value)) = self.inner.next() {
+            let seq = seq_of_internal_key(&ik_bytes);
+            // 快照过滤：seq > snapshot 的版本对当前快照不可见，跳过。
+            if seq > self.snapshot_seq {
+                continue;
+            }
             let vtype = vtype_of_internal_key(&ik_bytes);
             let user_key = user_key_of_internal_key(&ik_bytes).to_vec();
             // 跳过同 user_key 的后续版本（它们的 seq 更小 = 旧版本，对用户不可见）。
@@ -221,7 +228,7 @@ impl DBIter {
                     return;
                 }
                 ValueType::Delete => {
-                    // 最新版本是删除标记 → 该 user_key 不存在，继续找下一个。
+                    // 该 user_key 最新可见版本是删除标记 → 用户视角不存在，继续找下一个。
                 }
             }
         }
@@ -365,7 +372,7 @@ mod tests {
             ik(b"d", 1, ValueType::Put, b"vd"),
         ];
         let m = MergingIterator::new(vec![vec_iter(items)]);
-        let mut dbi = DBIter::new(m);
+        let mut dbi = DBIter::new(m, crate::internal_key::MAX_SEQUENCE);
         let out: Vec<(Vec<u8>, Vec<u8>)> = std::iter::from_fn(|| dbi.next()).collect();
         // c 被删除标记跳过。
         let keys: Vec<Vec<u8>> = out.iter().map(|(k, _)| k.clone()).collect();
@@ -383,7 +390,7 @@ mod tests {
             ik(b"x", 1, ValueType::Put, b"vx"),
         ];
         let m = MergingIterator::new(vec![vec_iter(items)]);
-        let mut dbi = DBIter::new(m);
+        let mut dbi = DBIter::new(m, crate::internal_key::MAX_SEQUENCE);
         let out: Vec<(Vec<u8>, Vec<u8>)> = std::iter::from_fn(|| dbi.next()).collect();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, b"x");
@@ -392,7 +399,7 @@ mod tests {
     #[test]
     fn db_iter_empty_input() {
         let m = MergingIterator::new(vec![]);
-        let mut dbi = DBIter::new(m);
+        let mut dbi = DBIter::new(m, crate::internal_key::MAX_SEQUENCE);
         assert!(dbi.next().is_none());
     }
 
