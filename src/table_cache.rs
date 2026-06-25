@@ -93,7 +93,7 @@ mod tests {
     use crate::memtable::MemTable;
     use std::path::PathBuf;
 
-    fn build_test_sst(dir: &PathBuf, num: FileNumber) {
+    fn build_test_sst(dir: &std::path::Path, num: FileNumber) {
         let mut mem = MemTable::new();
         mem.put(b"k", b"v");
         let path = sst_path(dir, num);
@@ -105,8 +105,7 @@ mod tests {
             "mulan-cache-test-{}-{}-{}",
             std::process::id(),
             label,
-            std::sync::atomic::AtomicU64::new(0)
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            std::sync::atomic::AtomicU64::new(0).fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -132,7 +131,10 @@ mod tests {
         let r1 = cache.get(FileNumber(1)).unwrap();
         cache.evict(FileNumber(1));
         let r2 = cache.get(FileNumber(1)).unwrap();
-        assert!(!Arc::ptr_eq(&r1, &r2), "after evict, re-open creates new Arc");
+        assert!(
+            !Arc::ptr_eq(&r1, &r2),
+            "after evict, re-open creates new Arc"
+        );
     }
 
     #[test]
@@ -176,7 +178,7 @@ mod tests {
         let cache = TableCache::with_capacity(dir, 2);
         cache.get(FileNumber(1)).unwrap(); // 1 在队尾
         cache.get(FileNumber(2)).unwrap(); // 2 在队尾，1 在队头
-        // 重新访问 1 → 1 移到队尾，2 变队头
+                                           // 重新访问 1 → 1 移到队尾，2 变队头
         cache.get(FileNumber(1)).unwrap();
         // 插入 3 → 淘汰队头（2），1 因在队尾而存活
         cache.get(FileNumber(3)).unwrap();

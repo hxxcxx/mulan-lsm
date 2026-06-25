@@ -119,11 +119,11 @@ impl TableBuilder {
             if let Some(handle) = self.pending_handle.take() {
                 let mut handle_buf = Vec::new();
                 handle.encode(&mut handle_buf);
-                self.index_block.add(&key, &handle_buf);
+                self.index_block.add(&key, &handle_buf)?;
             }
         }
 
-        self.data_block.add(internal_key, value);
+        self.data_block.add(internal_key, value)?;
         self.last_key.clear();
         self.last_key.extend_from_slice(internal_key);
         self.bloom.insert(user_key);
@@ -178,7 +178,7 @@ impl TableBuilder {
             if let Some(handle) = self.pending_handle.take() {
                 let mut handle_buf = Vec::new();
                 handle.encode(&mut handle_buf);
-                self.index_block.add(&key, &handle_buf);
+                self.index_block.add(&key, &handle_buf)?;
             }
         }
 
@@ -188,7 +188,7 @@ impl TableBuilder {
         let mut metaindex_builder = BlockBuilder::new();
         let mut meta_value = Vec::new();
         filter_handle.encode(&mut meta_value);
-        metaindex_builder.add(FILTER_META_KEY, &meta_value);
+        metaindex_builder.add(FILTER_META_KEY, &meta_value)?;
         let metaindex_handle = self.write_raw(&metaindex_builder.finish())?;
 
         // 写 index block。
@@ -203,7 +203,9 @@ impl TableBuilder {
         footer.extend_from_slice(&MAGIC.to_le_bytes());
         assert_eq!(footer.len(), FOOTER_LEN);
         self.file.write_all(&footer)?;
-
+        // 数据落盘：SSTable 是 flush/compaction 的提交对象，manifest 提交前必须确保
+        // SSTable 数据已 fsync 到磁盘，否则崩溃时 manifest 已说"SST 有效"但数据还在 page cache。
+        self.file.sync_all()?;
         Ok(())
     }
 

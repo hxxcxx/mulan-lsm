@@ -390,7 +390,7 @@ mod tests {
     fn build_block(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
         let mut b = BlockBuilder::new();
         for (k, v) in entries {
-            b.add(k, v);
+            let _ = b.add(k, v);
         }
         b.finish()
     }

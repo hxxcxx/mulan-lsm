@@ -1,4 +1,4 @@
-﻿//! Compaction：后台归并的触发、选文件、执行。
+//! Compaction：后台归并的触发、选文件、执行。
 
 use crate::error::{MulanError, Result};
 use crate::file_meta::{sst_path, FileMetaData, FileNumber, IdGenerator};
@@ -411,8 +411,9 @@ fn finish_current(
         .take()
         .ok_or_else(|| MulanError::Corrupted("compaction builder missing at finish".into()))?;
     b.finish()?;
-    let num = number
-        .ok_or_else(|| MulanError::Corrupted("compaction file number missing".into()))?;
+    let num =
+        number.ok_or_else(|| MulanError::Corrupted("compaction file number missing".into()))?;
+    // SSTable 数据落盘由 TableBuilder::finish 的 sync_all 保证。
     let file_size = std::fs::metadata(sst_path(dir, num))?.len();
     Ok(FileMetaData::new(
         num,
@@ -955,7 +956,12 @@ mod tests {
         let dir = tmp_compaction_dir("block_target");
         // 1000 条 entry，足够在 256 字节 block_target 下产生多个 data block。
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..1000u32)
-            .map(|i| (format!("key{i:05}").into_bytes(), format!("v{i}").into_bytes()))
+            .map(|i| {
+                (
+                    format!("key{i:05}").into_bytes(),
+                    format!("v{i}").into_bytes(),
+                )
+            })
             .collect();
         let f1 = build_sst(&dir, FileNumber(1), 0, &entries);
         let compaction = Compaction {
@@ -968,20 +974,40 @@ mod tests {
         // 极小 block_target (128 字节) → 大量 data block
         let mut id_gen = IdGenerator::new(100);
         let out_small = do_compaction(
-            &dir, &compaction, &version, &mut id_gen,
-            crate::internal_key::MAX_SEQUENCE, 128, 10,
-        ).unwrap();
-        let reader_small = TableReader::open(&sst_path(&dir, out_small.new_files[0].number)).unwrap();
-        let small_blocks = reader_small.into_table_iter().unwrap().blocks_loaded_capacity();
+            &dir,
+            &compaction,
+            &version,
+            &mut id_gen,
+            crate::internal_key::MAX_SEQUENCE,
+            128,
+            10,
+        )
+        .unwrap();
+        let reader_small =
+            TableReader::open(&sst_path(&dir, out_small.new_files[0].number)).unwrap();
+        let small_blocks = reader_small
+            .into_table_iter()
+            .unwrap()
+            .blocks_loaded_capacity();
 
         // 大 block_target (64KB) → 少量 data block
         let mut id_gen2 = IdGenerator::new(200);
         let out_large = do_compaction(
-            &dir, &compaction, &version, &mut id_gen2,
-            crate::internal_key::MAX_SEQUENCE, 64 * 1024, 10,
-        ).unwrap();
-        let reader_large = TableReader::open(&sst_path(&dir, out_large.new_files[0].number)).unwrap();
-        let large_blocks = reader_large.into_table_iter().unwrap().blocks_loaded_capacity();
+            &dir,
+            &compaction,
+            &version,
+            &mut id_gen2,
+            crate::internal_key::MAX_SEQUENCE,
+            64 * 1024,
+            10,
+        )
+        .unwrap();
+        let reader_large =
+            TableReader::open(&sst_path(&dir, out_large.new_files[0].number)).unwrap();
+        let large_blocks = reader_large
+            .into_table_iter()
+            .unwrap()
+            .blocks_loaded_capacity();
 
         assert!(
             small_blocks > large_blocks,

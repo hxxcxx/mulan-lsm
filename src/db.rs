@@ -35,6 +35,9 @@ pub struct Options {
     pub bloom_bits_per_key: usize,
     /// TableCache 最大缓存条目数。0 表示不缓存（每次 get 都打开文件）。
     pub table_cache_size: usize,
+    /// 每次 put/delete 后是否 fsync WAL。true = 同步写（durability 保证，默认）；
+    /// false = 异步写（更高吞吐，崩溃可能丢最近写入）。
+    pub sync_writes: bool,
     /// 禁用后台自动 compaction（测试用，配合 `compact_once` 手动控制）。
     pub disable_auto_compaction: bool,
 }
@@ -47,6 +50,7 @@ impl Default for Options {
             block_size: 4 * 1024,
             bloom_bits_per_key: 10,
             table_cache_size: 100,
+            sync_writes: true,
             disable_auto_compaction: false,
         }
     }
@@ -114,10 +118,7 @@ impl Db {
         };
         let inner = Arc::new((Mutex::new(db_inner), Condvar::new()));
         let table_cache = if cache_size > 0 {
-            Arc::new(TableCache::with_capacity(
-                dir.to_path_buf(),
-                cache_size,
-            ))
+            Arc::new(TableCache::with_capacity(dir.to_path_buf(), cache_size))
         } else {
             Arc::new(TableCache::with_capacity(dir.to_path_buf(), 0))
         };
@@ -190,6 +191,7 @@ impl Db {
                 options.block_size,
                 options.bloom_bits_per_key,
             )?;
+            // SSTable 数据落盘由 TableBuilder::finish 的 sync_all 保证。
             let sz = std::fs::metadata(&path)?.len();
             let (s, l) = match (smallest, largest) {
                 (Some(s), Some(l)) => (s, l),
@@ -197,6 +199,9 @@ impl Db {
             };
             let meta = FileMetaData::new(sst, sz, s, l);
             let new_log = id_gen.new_file_number();
+            // 先创建新 WAL 文件再提交 manifest（与 flush_memtable 一致的顺序）。
+            // recover_open 末尾会重新 open 它作为活跃 WAL。
+            let _ = WalWriter::create(&log_path(dir, new_log))?;
             let mut edit = VersionEdit::new();
             edit.add_file(0, meta)
                 .set_log_number(new_log.0)
@@ -252,6 +257,10 @@ impl Db {
         inner
             .wal
             .add_record(&encode_entry(vtype, seq, key, value))?;
+        // sync_writes=true 时 fsync WAL，保证 put 返回后数据已落盘（durability）。
+        if inner.options.sync_writes {
+            inner.wal.sync()?;
+        }
         inner.memtable.apply(vtype, seq, key, value);
         // write 立即推进 last_sequence，使其成为 seq 的唯一权威源（快照直接取它，
         // 避免 memtable.sequence 与 last_sequence 两个源头不一致）。
@@ -273,7 +282,16 @@ impl Db {
         let (lock, _) = &*self.inner;
         let inner = lock.lock().unwrap();
         let snapshot = inner.version_set.last_sequence;
-        self.get_internal(key, snapshot, &inner)
+        // MemTable 查询在持锁期间做（借用 memtable 无法跨锁存活）。
+        match inner.memtable.get_entry(key, snapshot)? {
+            Some((ValueType::Put, v)) => return Ok(Some(v)),
+            Some((ValueType::Delete, _)) => return Ok(None),
+            None => {}
+        }
+        let version = inner.version_set.current();
+        drop(inner);
+        // SSTable 查询释放锁后做（version 是 Arc，安全；table_cache 自带锁）。
+        self.get_from_sstables(key, snapshot, &version)
     }
 
     /// 按快照读：只看 seq ≤ 快照 seq 的版本。
@@ -282,24 +300,23 @@ impl Db {
         let snap_seq = snapshot.sequence();
         let (lock, _) = &*self.inner;
         let inner = lock.lock().unwrap();
-        self.get_internal(key, snap_seq, &inner)
-    }
-
-    /// `get` / `get_at` 共享的读逻辑。
-    /// 调用方负责持锁并提供 snapshot_seq。
-    fn get_internal(
-        &self,
-        key: &[u8],
-        snapshot_seq: u64,
-        inner: &std::sync::MutexGuard<'_, DbInner>,
-    ) -> Result<Option<Vec<u8>>> {
-        match inner.memtable.get_entry(key, snapshot_seq)? {
+        match inner.memtable.get_entry(key, snap_seq)? {
             Some((ValueType::Put, v)) => return Ok(Some(v)),
             Some((ValueType::Delete, _)) => return Ok(None),
             None => {}
         }
         let version = inner.version_set.current();
         drop(inner);
+        self.get_from_sstables(key, snap_seq, &version)
+    }
+
+    /// SSTable 层的读逻辑（释放锁后执行）。version 是 Arc<Version> 快照。
+    fn get_from_sstables(
+        &self,
+        key: &[u8],
+        snapshot_seq: u64,
+        version: &Arc<Version>,
+    ) -> Result<Option<Vec<u8>>> {
         for meta in version.files_at(0).iter().rev() {
             let r = self.table_cache.get(meta.number)?;
             if let Some((vt, v)) = r.get_entry(key, snapshot_seq)? {
@@ -431,6 +448,7 @@ fn flush_memtable(inner: &mut DbInner) -> Result<()> {
         inner.options.block_size,
         inner.options.bloom_bits_per_key,
     )?;
+    // SSTable 数据落盘由 TableBuilder::finish 的 sync_all 保证。
     let sz = std::fs::metadata(&path)?.len();
     let (s, l) = match (smallest, largest) {
         (Some(s), Some(l)) => (s, l),
@@ -441,15 +459,20 @@ fn flush_memtable(inner: &mut DbInner) -> Result<()> {
         }
     };
     let meta = FileMetaData::new(sst, sz, s, l);
+    // 先创建新 WAL 并 sync 旧 WAL，再提交 manifest。
+    // 顺序保证：manifest 提交时新 WAL 已存在且旧 WAL 数据已落盘。
+    // 若 create 新 WAL 失败，manifest 未提交，新 WAL 文件成孤儿（下次 open 清理），安全。
     let new_log = inner.id_gen.new_file_number();
+    let new_wal = WalWriter::create(&log_path(&inner.dir, new_log))?;
+    // 旧 WAL 必须落盘后才能切换：崩溃恢复靠旧 WAL 回放未 flush 的数据。
+    inner.wal.sync()?;
     let mut edit = VersionEdit::new();
     edit.add_file(0, meta)
         .set_log_number(new_log.0)
         .set_next_file_number(inner.id_gen.next_number())
         .set_last_sequence(frozen_seq);
     inner.version_set.write_new_version(&edit)?;
-    let _ = inner.wal.flush();
-    inner.wal = WalWriter::create(&log_path(&inner.dir, new_log))?;
+    inner.wal = new_wal;
     inner.wal_number = new_log;
     Ok(())
 }
@@ -509,13 +532,17 @@ fn run_one_compaction(
     for (_, num) in &output.deleted_files {
         cache.evict(*num);
     }
-    // 提交后清理被替换的旧 SSTable（孤儿），防磁盘空间膨胀。
-    // 只清理 SSTable；WAL/manifest 由 open 路径处理（运行期它们可能正被使用）。
-    remove_obsolete_ssts(&inner.dir, &inner.version_set)?;
+    // 不在运行期物理删除旧 SSTable：get_internal 释放锁后可能仍持有旧 Version 的 Arc，
+    // 此时删除文件会导致 table_cache.get 打开已删文件 → IO 错误。
+    // 旧文件留盘（Version 不引用它们，不影响正确性），下次 Db::open 时由
+    // remove_obsolete_files 清理。以暂留磁盘空间换取读路径安全。
     Ok(true)
 }
 
 /// 运行期清理：只删不属于当前 Version 的 SSTable（compaction 替换掉的旧文件）。
+/// 当前运行期不调用（改为延迟到 open 时由 remove_obsolete_files 清理），
+/// 保留以备未来实现 Version 引用计数后恢复即时清理。
+#[allow(dead_code)]
 fn remove_obsolete_ssts(dir: &Path, version_set: &VersionSet) -> Result<()> {
     let version = version_set.current();
     let mut live_sst: HashSet<FileNumber> = HashSet::new();
@@ -602,13 +629,11 @@ impl Drop for Db {
             let (lock, cvar) = &*self.inner;
             let mut g = lock.lock().unwrap();
             g.shutting_down = true;
-            let _ = g.wal.flush();
+            // Drop 前 sync WAL，保证关闭时所有写入已落盘。
+            let _ = g.wal.sync();
             cvar.notify_all();
         }
         if let Some(h) = self.bg_thread.take() {
-            // 最多等 5 秒让后台线程优雅退出；超时后 detach 避免永久阻塞。
-            let timeout = std::time::Duration::from_secs(5);
-            // join 没有原生超时，用线程 park/unpark 更复杂，这里简单 join 即可：
             // 后台线程在 shutting_down=true 后会退出等待循环。
             // 若它正阻塞在某个长 IO 上（如大 compaction），join 可能延迟——
             // 此时依赖 OS 在进程退出时回收资源，不会造成资源泄露。
