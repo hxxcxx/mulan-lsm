@@ -154,20 +154,41 @@ impl<'a> Block<'a> {
         u32::from_le_bytes(self.data[start..start + 4].try_into().unwrap()) as usize
     }
 
-    /// 解析指定偏移处的一条 entry，返回 (key, value, 下一条 entry 的偏移)。
+    /// 解析指定偏移处的一条 entry，返回 (key_delta, value, 下一条 entry 的偏移)。
+    /// 仅在 restart point（shared=0）处被调用，故返回 key_delta 即完整 key。
     fn entry_at(&self, offset: usize) -> Result<(Vec<u8>, &'a [u8], usize)> {
-        let (shared, n1) = decode_varint32(&self.data[offset..])?;
-        let (non_shared, n2) = decode_varint32(&self.data[offset + n1..])?;
-        let (value_len, n3) = decode_varint32(&self.data[offset + n1 + n2..])?;
+        let (_shared, n1) = decode_varint32(
+            self.data
+                .get(offset..)
+                .ok_or_else(|| MulanError::Corrupted("entry_at: offset out of bounds".into()))?,
+        )?;
+        let (non_shared, n2) = decode_varint32(self.data.get(offset + n1..).ok_or_else(|| {
+            MulanError::Corrupted("entry_at: non_shared varint out of bounds".into())
+        })?)?;
+        let (value_len, n3) =
+            decode_varint32(self.data.get(offset + n1 + n2..).ok_or_else(|| {
+                MulanError::Corrupted("entry_at: value_len varint out of bounds".into())
+            })?)?;
         let header_len = n1 + n2 + n3;
-        let key_delta_start = offset + header_len;
-        // shared > 0 时调用方需提供前一条 key 来重建；这里返回 shared 让调用方处理。
-        // 为简化，本函数只在 shared==0（restart point）处被调用，或由迭代器维护 last_key。
-        let _ = shared;
-        let key_delta = &self.data[key_delta_start..key_delta_start + non_shared as usize];
-        let value_start = key_delta_start + non_shared as usize;
-        let value_end = value_start + value_len as usize;
-        let value = &self.data[value_start..value_end];
+        let non_shared = non_shared as usize;
+        let value_len = value_len as usize;
+        let key_delta_start = offset
+            .checked_add(header_len)
+            .ok_or_else(|| MulanError::Corrupted("entry_at: header_len overflow".into()))?;
+        let key_delta_end = key_delta_start
+            .checked_add(non_shared)
+            .ok_or_else(|| MulanError::Corrupted("entry_at: non_shared overflow".into()))?;
+        let value_end = key_delta_end
+            .checked_add(value_len)
+            .ok_or_else(|| MulanError::Corrupted("entry_at: value_len overflow".into()))?;
+        let key_delta = self
+            .data
+            .get(key_delta_start..key_delta_end)
+            .ok_or_else(|| MulanError::Corrupted("entry_at: key_delta out of bounds".into()))?;
+        let value = self
+            .data
+            .get(key_delta_end..value_end)
+            .ok_or_else(|| MulanError::Corrupted("entry_at: value out of bounds".into()))?;
         Ok((key_delta.to_vec(), value, value_end))
     }
 
@@ -313,24 +334,32 @@ impl<'a> Block<'a> {
 
     /// 解析指定偏移的 entry，用 last_key 重建完整 key。
     fn parse_entry(&self, offset: usize, last_key: &[u8]) -> Option<ParsedEntry<'a>> {
-        let (shared, n1) = decode_varint32(&self.data[offset..]).ok()?;
-        let (non_shared, n2) = decode_varint32(&self.data[offset + n1..]).ok()?;
-        let (value_len, n3) = decode_varint32(&self.data[offset + n1 + n2..]).ok()?;
+        let (shared, n1) = decode_varint32(self.data.get(offset..)?).ok()?;
+        let (non_shared, n2) = decode_varint32(self.data.get(offset + n1..)?).ok()?;
+        let (value_len, n3) = decode_varint32(self.data.get(offset + n1 + n2..)?).ok()?;
         let header_len = n1 + n2 + n3;
-        let key_delta_start = offset + header_len;
-        let key_delta = &self.data[key_delta_start..key_delta_start + non_shared as usize];
-        let value_start = key_delta_start + non_shared as usize;
-        let value_end = value_start + value_len as usize;
+        let key_delta_start = offset.checked_add(header_len)?;
+        let non_shared = non_shared as usize;
+        let value_len = value_len as usize;
+        let shared = shared as usize;
+        // 切片前校验所有边界，损坏数据返回 None 而非 panic。
+        let key_delta_end = key_delta_start.checked_add(non_shared)?;
+        let value_start = key_delta_end;
+        let value_end = value_start.checked_add(value_len)?;
         if value_end > self.restarts_offset {
             return None;
         }
+        let key_delta = self.data.get(key_delta_start..key_delta_end)?;
+        if shared > last_key.len() {
+            return None;
+        }
         // 重建完整 key：last_key[..shared] + key_delta。
-        let mut full_key = Vec::with_capacity(shared as usize + non_shared as usize);
-        full_key.extend_from_slice(&last_key[..shared as usize]);
+        let mut full_key = Vec::with_capacity(shared + non_shared);
+        full_key.extend_from_slice(&last_key[..shared]);
         full_key.extend_from_slice(key_delta);
         Some(ParsedEntry {
             key: full_key,
-            value: &self.data[value_start..value_end],
+            value: self.data.get(value_start..value_end)?,
             next_offset: value_end,
         })
     }

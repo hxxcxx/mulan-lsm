@@ -211,7 +211,14 @@ impl Db {
             memtable = MemTable::with_initial_sequence(memtable.sequence());
             wal_number = new_log;
         } else {
-            wal_number = current_log;
+            // memtable 为空：不复用旧 WAL（其末尾可能有上次崩溃的残片，
+            // 追加后 read_records 遇残片 crc 失败会 break，丢弃后续新数据）。
+            // 分配新 WAL 编号 + 提交 manifest，旧 WAL 由 remove_obsolete_files 清理。
+            wal_number = id_gen.new_file_number();
+            let mut edit = VersionEdit::new();
+            edit.set_log_number(wal_number.0)
+                .set_next_file_number(id_gen.next_number());
+            version_set.write_new_version(&edit)?;
         }
         let wal = WalWriter::create(&log_path(dir, wal_number))?;
         remove_obsolete_files(dir, &version_set)?;

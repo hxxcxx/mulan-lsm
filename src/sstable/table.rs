@@ -368,7 +368,8 @@ impl TableIter {
     /// 从文件全部字节 + index handle 构造。解析 index 得到 data block handle 列表，
     /// 但不解析任何 data block（惰性）。
     fn new(data: Vec<u8>, index_handle: BlockHandle) -> Result<Self> {
-        let handles = Self::parse_data_handles(&data, &index_handle).unwrap_or_default();
+        // index 损坏必须向上传播，不能静默变空——否则 compaction 会丢整表数据。
+        let handles = Self::parse_data_handles(&data, &index_handle)?;
         Ok(TableIter {
             data,
             handles,
